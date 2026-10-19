@@ -17,6 +17,7 @@ lazy_static! {
         let mut idt = InterruptDescriptorTable::new();
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
         unsafe {
             // Double faults run on their own dedicated stack (set up in gdt.rs) so a
             // kernel stack overflow, which is itself a double fault, doesn't triple fault.
@@ -152,6 +153,48 @@ extern "x86-interrupt" fn page_fault_handler(
     println!("{:#?}", stack_frame);
     loop {
         x86_64::instructions::hlt();
+    }
+}
+
+/// Without this, a `#GP` has nowhere to go and escalates straight to a double
+/// fault, hiding the real cause (design-review item 9: the stale-SS bug in
+/// `gdt::init` needed QEMU `-d int` tracing to find for exactly that reason).
+///
+/// Reports, then panics rather than returning: `#GP` is a fault, so `iretq`
+/// would re-run the faulting instruction and fault again forever. Panicking
+/// (like `double_fault_handler`) also lets a test observe the real handler
+/// through its panic handler. Ending only the faulting *task* on a user-mode
+/// `#GP`, so the kernel carries on, needs an ISR-safe task exit and comes later.
+///
+/// The CPL of the faulting code is the RPL of the saved CS: the CPU pushes the
+/// interrupted CS, and CS's RPL always equals the CPL it was running at.
+/// Distinguishing the two is the point of Ring 3: a user-mode `#GP` is the
+/// kernel trapping a privilege violation, a kernel-mode one is a bug.
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    use x86_64::PrivilegeLevel;
+    use x86_64::structures::idt::SelectorErrorCode;
+
+    let _isr = IsrGuard::enter();
+    let user_mode = stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3;
+    println!("EXCEPTION: GENERAL PROTECTION FAULT");
+    // Zero for most causes (non-canonical address, privileged instruction).
+    // Non-zero means a segment selector was at fault, and the code *is* that
+    // selector's index/table, which is the clue item 9's bug needed.
+    if error_code == 0 {
+        println!("Error Code: 0 (not selector-related)");
+    } else {
+        println!("Error Code: {:#x} {:?}", error_code, SelectorErrorCode::new_truncate(error_code));
+    }
+    println!("{:#?}", stack_frame);
+    // Unformatted literals so tests can tell the two apart through
+    // `PanicInfo::message().as_str()` (`tests/general_protection.rs`).
+    if user_mode {
+        panic!("EXCEPTION: GENERAL PROTECTION FAULT in user mode");
+    } else {
+        panic!("EXCEPTION: GENERAL PROTECTION FAULT in kernel mode");
     }
 }
 

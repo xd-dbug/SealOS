@@ -112,9 +112,9 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
   `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md` for the full rationale (this one
   file *is* tracked in git despite `/docs` being gitignored — it was committed before the ignore
   rule). Serial output (`kernel/src/serial.rs`, `uart_16550`) is what tests report through.
-- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus thirteen
-  integration test binaries under `kernel/tests/`, each with different semantics. Four
-  (`should_panic`, `stack_overflow`, `page_fault`, `isr_heap_safety`) set `harness = false` in
+- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus fourteen
+  integration test binaries under `kernel/tests/`, each with different semantics. Five
+  (`should_panic`, `stack_overflow`, `page_fault`, `isr_heap_safety`, `general_protection`) set `harness = false` in
   `kernel/Cargo.toml`; the rest use the normal custom test harness. Tests that assert an exact
   interleaving (`cooperative_yield`, `run_queue`, `task_exit`) call
   `scheduler::set_preemption(false)` after `kernel::init()`; a tick would otherwise reorder them. **Heap-allocating tests must go in an integration
@@ -143,6 +143,8 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
     tasks, heap returns exactly to baseline (`allocator::used_bytes`) after spawn/exit cycles.
   - `isr_heap_safety.rs` — full init, then a test-local `int3` handler allocates under an
     `IsrGuard`; reaching the panic handler with the interrupt-context message is success.
+  - `general_protection.rs` — full init, keeping the kernel's real IDT; a non-canonical read
+    must reach the panic handler with the `#GP` handler's kernel-mode message (not a `#DF`).
   - `preemption.rs` — full init, preemption on; the W2 deliverable proof: CPU-bound
     never-yielding tasks hit exact totals within a tick budget, all GPRs survive preemption, heap
     churn, fresh-task IF, preemption-off never switches, and cooperative + preempted tasks mixed.
