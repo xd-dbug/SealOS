@@ -137,34 +137,72 @@ extern "x86-interrupt" fn double_fault_handler(
     let _isr = IsrGuard::enter();
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
-/// Page faults are unrecoverable here (no demand paging/heap growth yet), so
-/// this reports the faulting address/cause and halts rather than trying to
-/// resume execution. Must loop rather than `hlt()` once: with the timer IRQ
+/// A page fault from Ring 3 ends the offending task (`kill_user_task`) and the
+/// kernel carries on. One from Ring 0 is a kernel bug and unrecoverable (no
+/// demand paging/heap growth yet), so it reports the faulting address/cause
+/// and halts. That path must loop rather than `hlt()` once: with the timer IRQ
 /// unmasked, a single `hlt()` just sleeps until the next tick wakes it, and
 /// returning re-executes (and re-faults on) the same instruction forever.
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    use x86_64::PrivilegeLevel;
+
     let _isr = IsrGuard::enter();
     println!("EXCEPTION: PAGE FAULT");
     println!("Accessed Address: {:?}", Cr2::read());
     println!("Error Code: {:?}", error_code);
     println!("{:#?}", stack_frame);
+    if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3 {
+        kill_user_task("PAGE FAULT", &stack_frame);
+    }
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of user tasks killed by a Ring 3 fault since boot. Lets tests
+/// observe a kill without relying on a panic. Relaxed, like `TICKS`.
+pub fn user_faults() -> u64 {
+    USER_FAULTS.load(Ordering::Relaxed)
+}
+
+/// Ends the current task after a Ring 3 fault and switches away; returns only
+/// if the task can't be killed (the boot task, which never enters Ring 3), so
+/// the caller falls through to its kernel-fault path.
+///
+/// The fault is a protection check working as designed, not a kernel bug, so
+/// the kernel must survive it. The handler's `IsrGuard` and the fault frame
+/// stay on the dead stack, which is simply abandoned and later freed by
+/// `reap`; see `scheduler::exit_from_isr` for the `ISR_DEPTH` hand-off.
+fn kill_user_task(kind: &str, stack_frame: &InterruptStackFrame) {
+    if crate::scheduler::current_stack_top().is_none() {
+        return;
+    }
+    USER_FAULTS.fetch_add(1, Ordering::Relaxed);
+    println!(
+        "Killing user task {:?}: {} at rip {:?}",
+        crate::scheduler::current_id(),
+        kind,
+        stack_frame.instruction_pointer
+    );
+    // Safety: called from an exception handler on the task's own stack with
+    // no lock held (user code holds none); the task never runs again.
+    unsafe { crate::scheduler::exit_from_isr() }
 }
 
 /// Without this, a `#GP` has nowhere to go and escalates straight to a double
 /// fault, hiding the real cause (design-review item 9: the stale-SS bug in
 /// `gdt::init` needed QEMU `-d int` tracing to find for exactly that reason).
 ///
-/// Reports, then panics rather than returning: `#GP` is a fault, so `iretq`
-/// would re-run the faulting instruction and fault again forever. Panicking
-/// (like `double_fault_handler`) also lets a test observe the real handler
-/// through its panic handler. Ending only the faulting *task* on a user-mode
-/// `#GP`, so the kernel carries on, needs an ISR-safe task exit and comes later.
+/// A `#GP` from Ring 3 ends the offending task (`kill_user_task`). One from
+/// Ring 0 reports, then panics rather than returning: `#GP` is a fault, so
+/// `iretq` would re-run the faulting instruction and fault again forever.
+/// Panicking (like `double_fault_handler`) also lets a test observe the real
+/// handler through its panic handler.
 ///
 /// The CPL of the faulting code is the RPL of the saved CS: the CPU pushes the
 /// interrupted CS, and CS's RPL always equals the CPL it was running at.
@@ -189,10 +227,13 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         println!("Error Code: {:#x} {:?}", error_code, SelectorErrorCode::new_truncate(error_code));
     }
     println!("{:#?}", stack_frame);
-    // Unformatted literals so tests can tell the two apart through
+    // Unformatted literals so tests can tell the cases apart through
     // `PanicInfo::message().as_str()` (`tests/general_protection.rs`).
     if user_mode {
-        panic!("EXCEPTION: GENERAL PROTECTION FAULT in user mode");
+        kill_user_task("GENERAL PROTECTION FAULT", &stack_frame);
+        // Only reached for the boot task, which never enters Ring 3, so this
+        // means the scheduler's idea of the current task is wrong.
+        panic!("EXCEPTION: GENERAL PROTECTION FAULT in user mode with no user task to kill");
     } else {
         panic!("EXCEPTION: GENERAL PROTECTION FAULT in kernel mode");
     }
