@@ -13,12 +13,12 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - Physical memory management (bump + free-list physical frame allocator), paging (`OffsetPageTable` virtual memory mapper), and a kernel heap allocator (`linked_list_allocator`, exposing `Box`/`Vec`/`String` via `extern crate alloc`) — Layers 2–3 complete
 - Higher-half kernel: the kernel image is linked at `0xffff_ffff_8000_0000` (PML4 entry 511), all physical memory is mapped at `0xffff_8000_0000_0000`, and the heap lives at `0xffff_c000_0000_0000`, leaving the whole lower half free for future user address spaces
 - Kernel threads (Layer 4, Weeks 1-2): heap-backed task stacks, a naked-asm context switch, and a round-robin scheduler with a capped (`MAX_TASKS = 8`), allocation-free run queue; tasks can yield cooperatively, exit, or be preempted by the 10 ms timer tick. Heap use inside an interrupt handler is a checked panic (`allocator::GuardedHeap`)
-- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
+- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
 - A `#[test_case]` proving the keyboard handler decodes scancodes correctly (the handler itself works interactively; see the "Done" table below)
-- A `#GP` handler, and clearing the bootloader's leftover lower-half identity mapping (PML4[0]) before per-process page tables (see the "Done" table below)
+- Clearing the bootloader's leftover lower-half identity mapping (PML4[0]) before per-process page tables (see the "Done" table below)
 - Per-task address spaces, privilege separation (Ring 3), syscalls, and a shell (capstone-proper deliverables). Tasks are kernel threads on one shared page table, and their stacks have no guard page (an overflow is only caught by a canary check at switch time)
 
 If something in the code looks unfinished or stubbed, it probably is — this project is under active, weekly development. Check the commit history rather than assuming this list is current by the time you read it.
@@ -56,7 +56,7 @@ Current test suite backing all the "proven" claims below: **51 tests across 15 t
 | Breakpoint (`#BP`) handler | Done | `interrupts.rs`; proven by `test_breakpoint_exception` |
 | Double fault (`#DF`) handler | Done | Proven by `kernel/tests/stack_overflow.rs` (deliberate stack overflow, confirmed caught rather than triple-faulting) |
 | Page fault (`#PF`) handler | Done | Proven by `kernel/tests/page_fault.rs` (deliberate unmapped-address access, confirmed caught rather than triple-faulting/hanging) |
-| General-protection fault (`#GP`) handler | **Not done** | No `#GP` entry in `interrupts.rs`'s IDT. Not urgent pre-capstone — Ring 3 (Layer 4) is where `#GP`s start firing routinely — but tracked as `docs/design-review-2026-07-21.md` item 9 (local file) |
+| General-protection fault (`#GP`) handler | Done | `interrupts.rs`; reports the selector error code and whether ring 0 or ring 3 faulted, then panics. Proven by `kernel/tests/general_protection.rs` (non-canonical access, confirmed caught by the real handler rather than escalating to `#DF`) |
 
 **4. Hardware interrupts (PIC / timer / keyboard)** — implemented, keyboard unproven by automated test:
 

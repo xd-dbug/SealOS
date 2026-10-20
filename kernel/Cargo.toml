@@ -31,3 +31,7 @@ harness = false
 [[test]]
 name = "isr_heap_safety"
 harness = false
+
+[[test]]
+name = "general_protection"
+harness = false
