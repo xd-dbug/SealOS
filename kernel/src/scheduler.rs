@@ -318,6 +318,60 @@ pub fn exit() -> ! {
     unreachable!("a finished task was switched back into");
 }
 
+/// The `exit` for exception handlers: ends the faulting task and switches to
+/// the next. Same shape as `exit` (rotate with `Retire`, drop the lock, then
+/// switch), but the hand-off goes through `switch_from_isr` so `ISR_DEPTH`
+/// stays per-task.
+///
+/// Depth reasoning: the caller's `IsrGuard` made the depth 1 and lives in a
+/// frame on the dying stack. `switch_from_isr` parks that 1 in a local there
+/// and sets the depth to 0, and since the dead task never resumes, the parked
+/// value is never restored, which is exactly right. Whoever runs next
+/// then has the correct depth: a fresh task starts at 0 (plain mainline); a
+/// yielder was never in an ISR, so 0 is its own depth; a task preempted
+/// inside the timer ISR restores its own saved depth right after its
+/// `switch` returns. The abandoned `IsrGuard` and fault frame are plain stack
+/// memory freed with the stack; no destructor needs to run because the guard
+/// only touched the counter, which the swap already accounted for.
+///
+/// Frees nothing: the dead task's stack goes to `finished` and is reaped by
+/// mainline code (`reap`), since an ISR must not touch the heap. No EOI is
+/// needed: exceptions don't go through the PIC.
+///
+/// Callable only for a task with its own heap stack (not the boot task, which
+/// the scheduler needs as its fallback); callers check `current_stack_top`.
+///
+/// # Safety
+/// Must be called from an exception handler on the faulting task's own
+/// kernel stack, holding no locks, whose task will never be resumed.
+pub(crate) unsafe fn exit_from_isr() -> ! {
+    debug_assert!(
+        crate::interrupts::in_interrupt(),
+        "exit_from_isr called outside interrupt context"
+    );
+    // An interrupt gate cleared IF; a tick between rotation and `switch`
+    // would select again before the outgoing rsp is saved (see `select_next`).
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "exit_from_isr with interrupts enabled"
+    );
+    let (old_rsp, new_rsp) = with_scheduler(|s| {
+        assert!(s.current.stack_top().is_some(), "the boot task cannot exit");
+        s.rotate(Outgoing::Retire)
+            .expect("last runnable task finished; no boot task to return to")
+    });
+    // Safety: as in `exit` (`old_rsp` stays valid in `finished` until a later
+    // `reap`, the frame is never resumed), plus this is a handler on the
+    // dying task's own stack with no lock held and nothing to EOI.
+    unsafe { crate::interrupts::switch_from_isr(old_rsp, new_rsp) };
+    unreachable!("a finished task was switched back into");
+}
+
+/// Id of the running task, for fault reports.
+pub fn current_id() -> TaskId {
+    with_scheduler(|s| s.current.id())
+}
+
 /// Frees stacks of finished tasks. Runs on the resumed task, so `rsp` is
 /// guaranteed to be off the stacks being freed.
 ///
