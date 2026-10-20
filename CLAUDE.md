@@ -105,16 +105,34 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
   ISR-driven task switch goes through `interrupts::switch_from_isr` (swap to 0 → `switch` →
   restore), never a plain `switch` or an early guard drop. An ISR may take only locks mainline
   holds with IF=0 (`SCHEDULER`, and `PICS`, so any mainline `PICS.lock()` after `sti` needs
-  `without_interrupts`), and sends EOI before switching.
+  `without_interrupts`), and sends EOI before switching. A `#GP`/`#PF` from CPL 3 retires the
+  task instead of panicking: `kill_user_task` → `scheduler::exit_from_isr` (same `ISR_DEPTH`
+  hand-off via `switch_from_isr`; frees nothing, `reap` frees later) and bumps `user_faults()`.
+  CPL 0 `#GP` panics; CPL 0 `#PF` halts.
+- **Ring 3 (Layer 5 W3)**:
+  - GDT order is fixed by `sysret`: null, kernel code, kernel data, user data, user code, TSS.
+    `gdt::init` loads SS/DS/ES with kernel data. The TSS lives in an `UnsafeCell` wrapper;
+    `gdt::set_rsp0` (IF=0 only) is called by `Scheduler::rotate` with the incoming task's
+    `stack_top` (boot task skipped: no heap stack, never enters Ring 3), so a Ring 3 → 0 entry
+    lands on that task's own kernel stack.
+  - `kernel/src/user.rs` — one user image in PML4[1] (not PML4[0], the bootloader's identity
+    map): code page at `USER_CODE_START = 0x80_0000_0000`, a gap page, then a 4-page NX stack
+    ending at `USER_STACK_TOP`. `USER_ACCESSIBLE` at all four levels; code is copied via the
+    phys-offset mapping. `map_user_program` unmaps/frees the previous image, so there is **one
+    shared user image, no per-process address space**, and `spawn_user` must not be called
+    while an earlier user task could still run. `user_program!` assembles test programs.
+  - `spawn_user` → ordinary task → `enter_user` (`iretq` to CPL 3, IF=1, IOPL 0, GPRs cleared,
+    DS/ES = user data and not restored). SMAP/SMEP are off (kernel reads user memory freely).
 - **Text output**: the kernel renders text by software-blitting glyphs onto a UEFI GOP pixel
   framebuffer (`kernel/src/framebuffer.rs`, via `noto-sans-mono-bitmap`), not the legacy VGA text
   buffer at `0xb8000` — that address doesn't exist under a UEFI-only `bootloader` 0.11+ setup. See
   `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md` for the full rationale (this one
   file *is* tracked in git despite `/docs` being gitignored — it was committed before the ignore
   rule). Serial output (`kernel/src/serial.rs`, `uart_16550`) is what tests report through.
-- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus fourteen
-  integration test binaries under `kernel/tests/`, each with different semantics. Five
-  (`should_panic`, `stack_overflow`, `page_fault`, `isr_heap_safety`, `general_protection`) set `harness = false` in
+- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus twenty
+  integration test binaries under `kernel/tests/`, each with different semantics. Six
+  (`should_panic`, `stack_overflow`, `page_fault`, `isr_heap_safety`, `general_protection`,
+  `ring3_page_fault`) set `harness = false` in
   `kernel/Cargo.toml`; the rest use the normal custom test harness. Tests that assert an exact
   interleaving (`cooperative_yield`, `run_queue`, `task_exit`) call
   `scheduler::set_preemption(false)` after `kernel::init()`; a tick would otherwise reorder them. **Heap-allocating tests must go in an integration
@@ -145,6 +163,18 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
     `IsrGuard`; reaching the panic handler with the interrupt-context message is success.
   - `general_protection.rs` — full init, keeping the kernel's real IDT; a non-canonical read
     must reach the panic handler with the `#GP` handler's kernel-mode message (not a `#DF`).
+  - `gdt_rsp0.rs` — full init; `rotate` keeps RSP0 on the running task's stack (across yield and preemption), selector indices/RPLs, and
+    SS/DS/ES loaded with kernel data.
+  - `user_pages.rs` — full init; user mappings carry `USER_ACCESSIBLE` at every level, leaf
+    permissions (NX stack), code bytes, remap replaces the image, PML4[1] is the only user entry.
+  - `ring3_gp.rs` — full init; the Ring 3 entry proof: the program checks it runs at CPL 3, then
+    `hlt` raises `#GP`, which kills only that task.
+  - `ring3_page_fault.rs` — test-local IDT; a Ring 3 read of the (mapped, supervisor-only) heap faults as a
+    protection `#PF` (P=1, user bit) at `HEAP_START`.
+  - `ring3_preemption.rs` — full init; a never-yielding Ring 3 counter is preempted by the timer tick
+    with its register intact (also asserts SMAP off).
+  - `ring3_faults.rs` — full init; Ring 3 `#GP`/`#PF` kill the task (`user_faults()`), the
+    kernel and other tasks carry on, and the stack is reaped.
   - `preemption.rs` — full init, preemption on; the W2 deliverable proof: CPU-bound
     never-yielding tasks hit exact totals within a tick budget, all GPRs survive preemption, heap
     churn, fresh-task IF, preemption-off never switches, and cooperative + preempted tasks mixed.
@@ -157,8 +187,10 @@ dependency, duplicated IDT-building boilerplate in the test binaries, memory/hea
 others). Treat it as a living document — the `kernel-docs-sync` agent keeps it in sync as
 findings get addressed. Items 15–23 cover Layer 4 debt: W1 15–19 (lib-test heap corruption, no stack
 guard page, stack size, `Task` getter visibility; 18, lazy reaping, is addressed) and W2 20–23
-(preempted-only tasks don't reap, Ring 3 needs a per-task RSP0, preemption test gaps). Item 6's
-heap-in-ISR hazard is addressed. Unlike the spec above, this file is untracked (`/docs` is gitignored), so
+(preempted-only tasks don't reap, per-task RSP0 [21, addressed], preemption test gaps), and
+Layer 5 W3 24–29 (single shared user image, `spawn_user` vs. a live user task, SMAP/SMEP off,
+CPL 0 `#PF` halts, DS/ES left as user data, `USER_FAULTS` vs. a future `sys_exit`). Item 6's
+heap-in-ISR hazard and item 9 (`#GP` handler) are addressed. Unlike the spec above, this file is untracked (`/docs` is gitignored), so
 it's a local reference only and won't exist on a fresh clone.
 
 ## Conventions
@@ -169,7 +201,7 @@ it's a local reference only and won't exist on a fresh clone.
   typical defaults elsewhere, since it's a learning-focused capstone — don't strip comments down
   to nothing.
 - Shared/static state uses `lazy_static!` + `spin::Mutex`/`conquer_once::spin::OnceCell`, not bare
-  `static mut`. Other sanctioned forms: atomics (`TICKS`, `ISR_DEPTH`, `PREEMPTION`), the
+  `static mut`. Other sanctioned forms: atomics (`TICKS`, `ISR_DEPTH`, `PREEMPTION`, `USER_FAULTS`), `gdt.rs`'s `Tss(UnsafeCell<..>)` wrapper (the CPU reads the TSS directly; written only with IF=0), the
   `#[global_allocator]` `GuardedHeap` (its `LockedHeap` has its own internal lock), and test-local `lazy_static!` IDTs in integration tests. The one `static mut` exception,
   `gdt.rs`'s IST guard stack, is accessed only via `&raw const`/`&raw mut`, never a reference —
   see `kernel-safety-reviewer` for the full rule.

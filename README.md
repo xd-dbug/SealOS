@@ -8,26 +8,27 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - Boots via UEFI (OVMF firmware) in QEMU to a graphical framebuffer
 - Text output to the framebuffer (`println!`/`print!`) via software-rendered glyphs — not legacy VGA text mode, which isn't available under UEFI/GOP boot (see `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md` for why)
 - Serial output over COM1 (`serial_println!`/`serial_print!`) via `uart_16550`
-- GDT with a dedicated Interrupt Stack Table (IST) entry for double faults
-- IDT with breakpoint, double-fault, and page-fault handlers, plus timer (IRQ0, PIT at 100 Hz) and keyboard (IRQ1) handlers behind remapped PICs
+- GDT with kernel and user (Ring 3) segments in `sysret` order, a dedicated Interrupt Stack Table (IST) entry for double faults, and a per-task TSS RSP0 updated on every task switch
+- IDT with breakpoint, double-fault, general-protection, and page-fault handlers, plus timer (IRQ0, PIT at 100 Hz) and keyboard (IRQ1) handlers behind remapped PICs
 - Physical memory management (bump + free-list physical frame allocator), paging (`OffsetPageTable` virtual memory mapper), and a kernel heap allocator (`linked_list_allocator`, exposing `Box`/`Vec`/`String` via `extern crate alloc`) — Layers 2–3 complete
 - Higher-half kernel: the kernel image is linked at `0xffff_ffff_8000_0000` (PML4 entry 511), all physical memory is mapped at `0xffff_8000_0000_0000`, and the heap lives at `0xffff_c000_0000_0000`, leaving the whole lower half free for future user address spaces
 - Kernel threads (Layer 4, Weeks 1-2): heap-backed task stacks, a naked-asm context switch, and a round-robin scheduler with a capped (`MAX_TASKS = 8`), allocation-free run queue; tasks can yield cooperatively, exit, or be preempted by the 10 ms timer tick. Heap use inside an interrupt handler is a checked panic (`allocator::GuardedHeap`)
-- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
+- Ring 3 (Layer 5, Week 3): one user image (code + NX stack) mapped in PML4[1] with `USER_ACCESSIBLE`, entered via `iretq` from an ordinary scheduled task; the timer preempts it, and a `#GP`/`#PF` from Ring 3 kills only that task. All tasks share one user image and one page table, and there are no syscalls yet
+- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`, `gdt_rsp0`, `user_pages`, `ring3_gp`, `ring3_page_fault`, `ring3_preemption`, `ring3_faults`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
 - A `#[test_case]` proving the keyboard handler decodes scancodes correctly (the handler itself works interactively; see the "Done" table below)
 - Clearing the bootloader's leftover lower-half identity mapping (PML4[0]) before per-process page tables (see the "Done" table below)
-- Per-task address spaces, privilege separation (Ring 3), syscalls, and a shell (capstone-proper deliverables). Tasks are kernel threads on one shared page table, and their stacks have no guard page (an overflow is only caught by a canary check at switch time)
+- Per-process address spaces, syscalls, and a shell (capstone-proper deliverables). Ring 3 exists but every user task shares one user image and page table; kernel tasks are threads on that same table, and their stacks have no guard page (an overflow is only caught by a canary check at switch time)
 
 If something in the code looks unfinished or stubbed, it probably is — this project is under active, weekly development. Check the commit history rather than assuming this list is current by the time you read it.
 
  **Done**
 
-Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (kernel-thread scheduling, Ring 3, syscalls, a shell) started 2026-10-05; only the kernel-thread scheduling groundwork (Weeks 1-2: the bullet above and the "Testing" list below) exists so far and isn't evaluated in these tables.
+Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (kernel-thread scheduling, Ring 3, syscalls, a shell) started 2026-10-05; only the kernel-thread scheduling (Weeks 1-2) and Ring 3 entry/fault-handling (Layer 5 Week 3) groundwork, in the bullets above and the "Testing" list below, exists so far and isn't evaluated in these tables.
 
-Current test suite backing all the "proven" claims below: **51 tests across 15 test binaries** (`cargo test` from `kernel/`), all passing as of this check.
+Current test suite backing all the "proven" claims below: **70 tests across 22 test binaries** (the `lib` and `main` unit-test binaries plus 20 integration binaries) (`cargo test` from `kernel/`), all passing as of this check.
 
 **1. Bootloader / boot handoff** — done:
 
@@ -51,12 +52,12 @@ Current test suite backing all the "proven" claims below: **51 tests across 15 t
 
 | Item | Status | Evidence |
 |---|---|---|
-| GDT with kernel code segment + TSS | Done | `gdt.rs` |
+| GDT with kernel code/data, user data/code segments + TSS | Done | `gdt.rs`; proven by `kernel/tests/gdt_rsp0.rs` (RSP0 tracks the running task) and the `ring3_*` tests |
 | Dedicated IST stack for double faults | Done | `gdt.rs`'s `DOUBLE_FAULT_IST_INDEX`, wired to `interrupts.rs`'s `double_fault` handler |
 | Breakpoint (`#BP`) handler | Done | `interrupts.rs`; proven by `test_breakpoint_exception` |
 | Double fault (`#DF`) handler | Done | Proven by `kernel/tests/stack_overflow.rs` (deliberate stack overflow, confirmed caught rather than triple-faulting) |
-| Page fault (`#PF`) handler | Done | Proven by `kernel/tests/page_fault.rs` (deliberate unmapped-address access, confirmed caught rather than triple-faulting/hanging) |
-| General-protection fault (`#GP`) handler | Done | `interrupts.rs`; reports the selector error code and whether ring 0 or ring 3 faulted, then panics. Proven by `kernel/tests/general_protection.rs` (non-canonical access, confirmed caught by the real handler rather than escalating to `#DF`) |
+| Page fault (`#PF`) handler | Done | Proven by `kernel/tests/page_fault.rs` (deliberate unmapped-address access, confirmed caught rather than triple-faulting/hanging); a Ring 3 `#PF` kills the task (`ring3_page_fault.rs`, `ring3_faults.rs`) |
+| General-protection fault (`#GP`) handler | Done | `interrupts.rs`; reports the selector error code and whether ring 0 or ring 3 faulted, then panics for Ring 0 faults and kills only the task for Ring 3 faults. Proven by `kernel/tests/general_protection.rs`, `ring3_gp.rs`, `ring3_faults.rs` (non-canonical access, confirmed caught by the real handler rather than escalating to `#DF`) |
 
 **4. Hardware interrupts (PIC / timer / keyboard)** — implemented, keyboard unproven by automated test:
 
@@ -97,7 +98,7 @@ Current test suite backing all the "proven" claims below: **51 tests across 15 t
 | `alloc` crate usable | Done | `extern crate alloc;` in `lib.rs`; no explicit `#[alloc_error_handler]` — this toolchain's default OOM-abort behavior (stable since ~Rust 1.68) covers it, confirmed by a clean `cargo build` with no missing-lang-item error |
 | Proven working | Done | 7 `#[test_case]`s in `kernel/src/allocator.rs` (`Box`/`Vec` round-trips, a 10,000-cycle stress test, an alignment audit, a fragmentation check) plus 3 more in the dedicated-boot `kernel/tests/heap_allocation.rs` (`Box`, `Vec`, `String`) |
 
-**Not evaluated (out of scope, Layer 4+):** the Week 1-2 kernel-thread scheduler (`task.rs`, `context.rs`, `scheduler.rs`) is covered only by its integration tests, not by the tables above; Ring 3/privilege separation, syscalls and a shell don't exist in the repo yet — not a gap in this checklist, just outside what pre-capstone is claiming.
+**Not evaluated (out of scope, Layer 4+):** the Week 1-2 kernel-thread scheduler (`task.rs`, `context.rs`, `scheduler.rs`) and the Week 3 Ring 3 support (`user.rs`, the GDT user segments) are covered only by their integration tests, not by the tables above; syscalls and a shell don't exist in the repo yet — not a gap in this checklist, just outside what pre-capstone is claiming.
 
 ## Architecture
 
@@ -123,7 +124,8 @@ Two independent Cargo projects live in this repo:
         ├── allocator.rs  # kernel heap (#[global_allocator])
         ├── task.rs       # Task/TaskId, heap-backed stacks
         ├── context.rs    # naked context switch, new-task trampoline
-        └── scheduler.rs  # round-robin run queue, spawn/yield/exit, timer preemption hook
+        ├── scheduler.rs  # round-robin run queue, spawn/yield/exit, timer preemption hook, per-task RSP0
+        └── user.rs       # Ring 3 image mapping, spawn_user/enter_user
 ```
 
 **Why two crates:** `kernel` needs its own target spec, its own `build-std` configuration, and `no_std`. Keeping it a fully separate Cargo project (its own `target/` directory, its own `.cargo/config.toml`) avoids a workspace deadlock where a nested `cargo build` inside `build.rs` blocks on the same build lock as the outer build.
@@ -172,6 +174,11 @@ Tests run inside the actual kernel environment rather than on the host, since mo
   - `task_exit.rs` — explicit `exit()` (also from a nested call), prompt reaping, and heap usage returning exactly to baseline after repeated spawn/exit
   - `preemption.rs` — CPU-bound tasks that never yield still all progress under the timer tick, with all registers surviving preemption, heap churn, and cooperative and preempted tasks mixed
   - `isr_heap_safety.rs` — confirms that allocating from interrupt context is detected and panics, while normal allocation still works
+  - `general_protection.rs` — a Ring 0 `#GP` reaches the real handler instead of escalating to `#DF`
+  - `gdt_rsp0.rs` — the scheduler keeps the TSS's RSP0 on the running task's kernel stack
+  - `user_pages.rs` — user mappings are `USER_ACCESSIBLE` at every level, stack is NX, kernel pages stay supervisor-only
+  - `ring3_gp.rs`, `ring3_page_fault.rs`, `ring3_faults.rs` — privilege violations from Ring 3 are caught, kill only the offending task, and the kernel carries on
+  - `ring3_preemption.rs` — a spinning Ring 3 task is preempted by the timer tick
 
 A test binary reports success or failure by writing an exit code to QEMU's `isa-debug-exit` I/O port; `runner` reads QEMU's process exit code and translates it back into something `cargo test` understands.
 
