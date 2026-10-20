@@ -35,3 +35,11 @@ harness = false
 [[test]]
 name = "general_protection"
 harness = false
+
+[[test]]
+name = "ring3_gp"
+harness = false
+
+[[test]]
+name = "ring3_page_fault"
+harness = false

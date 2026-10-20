@@ -229,6 +229,118 @@ macro_rules! user_program {
     };
 }
 
+/// Why `spawn_user` refused.
+#[derive(Debug)]
+pub enum SpawnUserError {
+    Map(MapError),
+    Spawn(crate::scheduler::SpawnError),
+}
+
+/// Maps `code` and queues a kernel task that drops into it at Ring 3. The
+/// task is an ordinary scheduled task (its heap stack is what RSP0 points at
+/// while it runs), so it is preempted and resumed like any other.
+///
+/// Maps first, spawns second: a failed spawn leaves a mapped but unused
+/// program, which the next `map_user_program` frees. Never call this while an
+/// earlier user task might still be running, since remapping frees the frames
+/// it executes on.
+pub fn spawn_user(code: &[u8]) -> Result<crate::task::TaskId, SpawnUserError> {
+    map_user_program(code).map_err(SpawnUserError::Map)?;
+    crate::scheduler::spawn(user_task_entry).map_err(SpawnUserError::Spawn)
+}
+
+/// Entry of every user task. Takes no arguments because there is exactly one
+/// user image (`USER_CODE_START`/`USER_STACK_TOP`); per-process images come
+/// with per-process address spaces.
+extern "C" fn user_task_entry() {
+    // Safety: `spawn_user` mapped the image these constants describe.
+    unsafe { enter_user(VirtAddr::new(USER_CODE_START), VirtAddr::new(USER_STACK_TOP)) }
+}
+
+/// Drops to Ring 3 at `entry` with `rsp = stack_top` and never returns.
+///
+/// `iretq` is the only way down from Ring 0 that sets CS, SS, RSP, RIP and
+/// RFLAGS atomically: it pops RIP, CS, RFLAGS, RSP, SS, and because the new
+/// CS has a higher RPL it takes the privilege-change path. The frame is
+/// built by hand with the user selectors (RPL 3, from the GDT) and RFLAGS
+/// `0x202` = IF set (so the timer can preempt Ring 3; without it the task
+/// could never be descheduled) plus the always-one bit 1, IOPL 0 (so `cli`,
+/// `hlt` and port I/O fault).
+///
+/// DS and ES get the user data selector so Ring 3 does not start with
+/// kernel-DPL descriptors cached. Long mode ignores their bases and limits,
+/// so this is hygiene, not a security boundary. FS/GS are left alone: they
+/// are null and nothing sets their bases yet.
+///
+/// Every GPR is zeroed after the pushes so no kernel pointer or value leaks
+/// into user mode; the pushes use rax/rcx/rdx/rsi/rdi, which are pinned as
+/// inputs and then cleared with the rest.
+///
+/// Kernel stack: this call's frames (and the task's trampoline frame) below
+/// `stack_top` become dead the instant `iretq` runs, since the task never
+/// returns here. A later Ring 3 -> 0 interrupt lands at RSP0 = `stack_top`
+/// and overwrites them, which is fine. Nothing live sits above or at
+/// `stack_top`, and the canary is at the bottom.
+///
+/// # Safety
+/// `entry` and `stack_top` must be mapped user-accessible (code executable,
+/// stack writable), the GDT/TSS must be loaded, and the caller must be a
+/// scheduled task whose kernel stack `gdt::rsp0` already names.
+pub unsafe fn enter_user(entry: VirtAddr, stack_top: VirtAddr) -> ! {
+    use x86_64::registers::segmentation::{DS, ES, Segment};
+
+    // IF=1 here (the trampoline's `sti`), deliberately: a tick before `iretq`
+    // is an ordinary Ring 0 preemption on the current stack, and RSP0 is
+    // reloaded for this task by `rotate` before it resumes.
+    debug_assert_eq!(
+        Some(crate::gdt::rsp0()),
+        crate::scheduler::current_stack_top(),
+        "enter_user from a task whose kernel stack RSP0 doesn't name"
+    );
+    let user_data = crate::gdt::user_data_selector();
+    let user_code = crate::gdt::user_code_selector();
+    // Safety: a valid GDT data descriptor, loaded from Ring 0.
+    unsafe {
+        DS::set_reg(user_data);
+        ES::set_reg(user_data);
+    }
+    // Safety: the frame below is exactly what `iretq` expects for a
+    // privilege-raising return (see the contract above). `noreturn`: control
+    // never comes back, so nothing needs preserving or declaring clobbered.
+    unsafe {
+        core::arch::asm!(
+            // Frame, pushed high to low: SS, RSP, RFLAGS, CS, RIP.
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "xor eax, eax",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "xor ebx, ebx",
+            "xor ebp, ebp",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xor r12d, r12d",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
+            "iretq",
+            in("rax") user_data.0 as u64,
+            in("rcx") stack_top.as_u64(),
+            in("rdx") 0x202u64,
+            in("rsi") user_code.0 as u64,
+            in("rdi") entry.as_u64(),
+            options(noreturn),
+        )
+    }
+}
+
 user_program!(pub placeholder_program, "2: pause\n jmp 2b");
 
 #[test_case]
