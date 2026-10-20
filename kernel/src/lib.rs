@@ -24,6 +24,7 @@ pub mod memory;
 pub mod task;
 pub mod context;
 pub mod scheduler;
+pub mod user;
 
 /// Start of the upper (kernel) half of the canonical address space. Everything
 /// the kernel owns lives at or above this so the whole lower half
