@@ -63,6 +63,16 @@ impl Scheduler {
         debug_assert_eq!(*next.state(), TaskState::Ready);
 
         let new_rsp = next.saved_rsp();
+        // Ring 3 -> 0 entries must land on the incoming task's own kernel
+        // stack. IF=0 here (every caller holds the lock via `with_scheduler`).
+        // The boot task has no heap stack and never enters ring 3, so RSP0 is
+        // simply left as the previous task's value instead of being pointed
+        // at the bootloader's stack. That value may dangle once the previous
+        // task is reaped, which is harmless only because RSP0 is read solely
+        // on a ring 3 entry.
+        if let Some(top) = next.stack_top() {
+            crate::gdt::set_rsp0(top);
+        }
         next.set_state(TaskState::Running);
         let mut prev = core::mem::replace(&mut self.current, next);
         // Taken before the move into a queue: moving a `Box` keeps the
@@ -255,6 +265,12 @@ pub fn yield_now() {
         }
     });
     reap();
+}
+
+/// Top of the running task's kernel stack (`None` for the boot task). Exists
+/// so tests can compare it with `gdt::rsp0()`.
+pub fn current_stack_top() -> Option<VirtAddr> {
+    with_scheduler(|s| s.current.stack_top())
 }
 
 /// Number of exited tasks whose stacks are still waiting to be freed. Exists
