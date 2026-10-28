@@ -86,6 +86,11 @@ fn kernel_survives_two_privilege_violations() {
     while ready_count() > 0 {
         yield_now();
     }
+    // If a tick preempted us and the warm-up task exited back into the timer
+    // ISR, nothing reaped it (design-review item 20); its stack would then
+    // inflate the baseline. This yield reaps it.
+    yield_now();
+    assert_eq!(finished_count(), 0);
     let baseline = used_bytes();
     assert_eq!(user_faults(), 0);
 
