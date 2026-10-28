@@ -7,9 +7,14 @@ use x86_64::VirtAddr;
 use x86_64::registers::model_specific::{Efer, EferFlags};
 use x86_64::structures::paging::mapper::{MapToError, UnmapError};
 use x86_64::structures::paging::{
-    FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageSize, PageTableFlags,
-    PhysFrame, Size4KiB,
+    FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageSize, PageTable,
+    PageTableFlags, PhysFrame, Size4KiB,
 };
+
+/// One past the highest user address: the lower canonical half ends here and
+/// `crate::KERNEL_HALF_START` begins the upper one. Everything in between is
+/// non-canonical.
+pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
 
 /// Base of the user program's code page: PML4 index 1
 /// (`0x0000_0080_0000_0000 >> 39 == 1`). Deliberately not PML4[0]: the
@@ -187,6 +192,88 @@ fn map_one(
             Err(MapError::Map(e))
         }
     }
+}
+
+/// `ptr..ptr + len` was not wholly inside mapped, user-accessible memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadUserPointer;
+
+/// Runs `f` on the user bytes at `ptr..ptr + len`, but only after checking
+/// that Ring 3 itself could read every one of them, so a syscall can never
+/// be tricked into reading kernel memory or faulting at CPL 0:
+/// - `ptr + len` must not overflow (else the range wraps around to kernel
+///   space and the end check below would pass);
+/// - the range must end at or below `USER_SPACE_END` (lower half, so also
+///   canonical);
+/// - every page it touches, not just the first, must be present and
+///   `USER_ACCESSIBLE` at all four levels, as the CPU checks for Ring 3.
+///
+/// The `MAPPER` lock is held while `f` runs, so the pages can't be unmapped
+/// between the check and the read. `f` must therefore not take `MAPPER` or
+/// `FRAME_ALLOCATOR` itself, nor yield (another task could spin on the lock).
+///
+/// An empty range is accepted without looking at `ptr`: zero bytes are read.
+///
+/// Precondition: nothing but the calling task may run code in the user image
+/// while `f` runs. `f` gets a `&[u8]` straight over user memory, which is only
+/// sound if nobody writes it meanwhile. True today (one shared image, its one
+/// task blocked in this syscall), but a second live user task, or SMP, needs
+/// a copy into a kernel buffer instead (design-review item 31).
+pub fn with_user_bytes<R>(
+    ptr: u64,
+    len: u64,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Result<R, BadUserPointer> {
+    if len == 0 {
+        return Ok(f(&[]));
+    }
+    let end = ptr.checked_add(len).ok_or(BadUserPointer)?;
+    if end > USER_SPACE_END {
+        return Err(BadUserPointer);
+    }
+    let mapper = MAPPER.get().expect("MAPPER not initialized").lock();
+    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(ptr));
+    let last = Page::<Size4KiB>::containing_address(VirtAddr::new(end - 1));
+    if !Page::range_inclusive(first, last).all(|page| user_readable(&mapper, page.start_address())) {
+        return Err(BadUserPointer);
+    }
+    // Safety: every page of the range is mapped user-readable (checked above
+    // under the lock still held), so the read can't fault. SMAP is off, so
+    // CPL 0 may read it directly; with SMAP on, this is where `stac`/`clac`
+    // would bracket `f`. The bytes belong to the calling task, which is
+    // blocked in this syscall, and the one shared user image is never
+    // written by kernel code, so nothing mutates them while `f` reads.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    Ok(f(bytes))
+}
+
+/// Whether a CPL 3 read of `addr` would succeed: present and
+/// `USER_ACCESSIBLE` at every level, since the CPU ANDs U/S across the walk
+/// (see `TABLE_FLAGS`). A huge page ends the walk early, but only in a PDPT
+/// (1 GiB) or PD (2 MiB) entry: the bit is reserved in a PML4 entry.
+fn user_readable(mapper: &OffsetPageTable<'static>, addr: VirtAddr) -> bool {
+    let required = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    let offset = mapper.phys_offset();
+    let mut table: &PageTable = mapper.level_4_table();
+    let indices = [addr.p4_index(), addr.p3_index(), addr.p2_index(), addr.p1_index()];
+    for (level, index) in indices.into_iter().enumerate() {
+        let entry = &table[index];
+        if !entry.flags().contains(required) {
+            return false;
+        }
+        if level == 3 {
+            return true;
+        }
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return level != 0;
+        }
+        let next: *const PageTable = (offset + entry.addr().as_u64()).as_ptr();
+        // Safety: a present, non-huge entry points at a page table, reachable
+        // through the physical-memory offset mapping; the `MAPPER` lock the
+        // caller holds keeps it from changing.
+        table = unsafe { &*next };
+    }
+    unreachable!("the level-1 entry always ends the walk")
 }
 
 /// Defines `pub fn $name() -> &'static [u8]` returning the machine code of

@@ -25,6 +25,7 @@ pub mod task;
 pub mod context;
 pub mod scheduler;
 pub mod user;
+pub mod syscall;
 
 /// Start of the upper (kernel) half of the canonical address space. Everything
 /// the kernel owns lives at or above this so the whole lower half
@@ -64,8 +65,9 @@ pub trait Testable {
 
 /// Brings up CPU-level state needed before anything else can run safely:
 /// segment/TSS descriptors, then the interrupt handlers that depend on them,
-/// then the PICs (remapped to vectors 32+ so they can't collide with CPU
-/// exception vectors 0-31) and the PIT that drives IRQ0, then the frame
+/// the `syscall`/`sysret` MSRs (built from the same selectors), then the PICs
+/// (remapped to vectors 32+ so they can't collide with CPU exception vectors
+/// 0-31) and the PIT that drives IRQ0, then the frame
 /// allocator, page-table mapper, and heap (in that order, each needing the
 /// one before it), the scheduler (needs the heap; turns timer preemption on),
 /// and finally
@@ -82,6 +84,8 @@ pub trait Testable {
 pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions) {
     gdt::init();
     interrupts::init_idt();
+    // STAR is built from the GDT's selectors, so after `gdt::init`.
+    syscall::init();
     unsafe { interrupts::PICS.lock().initialize() };
     // Unmask only IRQ0 (timer, bit 0) and IRQ1 (keyboard, bit 1) on the
     // master PIC; the slave PIC's cascade line (IRQ2) and everything else

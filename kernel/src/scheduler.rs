@@ -64,14 +64,16 @@ impl Scheduler {
 
         let new_rsp = next.saved_rsp();
         // Ring 3 -> 0 entries must land on the incoming task's own kernel
-        // stack. IF=0 here (every caller holds the lock via `with_scheduler`).
-        // The boot task has no heap stack and never enters ring 3, so RSP0 is
-        // simply left as the previous task's value instead of being pointed
-        // at the bootloader's stack. That value may dangle once the previous
-        // task is reaped, which is harmless only because RSP0 is read solely
-        // on a ring 3 entry.
+        // stack, both the CPU's (an interrupt, via TSS.RSP0) and the syscall
+        // stub's (which switches by hand). IF=0 here (every caller holds the
+        // lock via `with_scheduler`). The boot task has no heap stack and
+        // never enters ring 3, so both are simply left as the previous task's
+        // value instead of being pointed at the bootloader's stack. That
+        // value may dangle once the previous task is reaped, which is
+        // harmless only because both are read solely on a ring 3 entry.
         if let Some(top) = next.stack_top() {
             crate::gdt::set_rsp0(top);
+            crate::syscall::set_kernel_stack(top);
         }
         next.set_state(TaskState::Running);
         let mut prev = core::mem::replace(&mut self.current, next);
