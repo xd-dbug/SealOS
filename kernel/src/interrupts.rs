@@ -170,6 +170,13 @@ pub fn user_faults() -> u64 {
     USER_FAULTS.load(Ordering::Relaxed)
 }
 
+/// Counts a user task the kernel is about to end for misbehaving outside an
+/// exception handler (`syscall::syscall_handler`'s unsafe-return kill), so
+/// `user_faults` covers every kill, not just `#GP`/`#PF`.
+pub(crate) fn count_user_fault() {
+    USER_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Ends the current task after a Ring 3 fault and switches away; returns only
 /// if the task can't be killed (the boot task, which never enters Ring 3), so
 /// the caller falls through to its kernel-fault path.
@@ -182,7 +189,7 @@ fn kill_user_task(kind: &str, stack_frame: &InterruptStackFrame) {
     if crate::scheduler::current_stack_top().is_none() {
         return;
     }
-    USER_FAULTS.fetch_add(1, Ordering::Relaxed);
+    count_user_fault();
     println!(
         "Killing user task {:?}: {} at rip {:?}",
         crate::scheduler::current_id(),

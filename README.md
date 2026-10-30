@@ -13,20 +13,21 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - Physical memory management (bump + free-list physical frame allocator), paging (`OffsetPageTable` virtual memory mapper), and a kernel heap allocator (`linked_list_allocator`, exposing `Box`/`Vec`/`String` via `extern crate alloc`) — Layers 2–3 complete
 - Higher-half kernel: the kernel image is linked at `0xffff_ffff_8000_0000` (PML4 entry 511), all physical memory is mapped at `0xffff_8000_0000_0000`, and the heap lives at `0xffff_c000_0000_0000`, leaving the whole lower half free for future user address spaces
 - Kernel threads (Layer 4, Weeks 1-2): heap-backed task stacks, a naked-asm context switch, and a round-robin scheduler with a capped (`MAX_TASKS = 8`), allocation-free run queue; tasks can yield cooperatively, exit, or be preempted by the 10 ms timer tick. Heap use inside an interrupt handler is a checked panic (`allocator::GuardedHeap`)
-- Ring 3 (Layer 5, Week 3): one user image (code + NX stack) mapped in PML4[1] with `USER_ACCESSIBLE`, entered via `iretq` from an ordinary scheduled task; the timer preempts it, and a `#GP`/`#PF` from Ring 3 kills only that task. All tasks share one user image and one page table, and there are no syscalls yet
+- Ring 3 (Layer 5, Week 3): one user image (code + NX stack) mapped in PML4[1] with `USER_ACCESSIBLE`, entered via `iretq` from an ordinary scheduled task; the timer preempts it, and a `#GP`/`#PF` from Ring 3 kills only that task. All tasks share one user image and one page table
+- Syscalls (Layer 5, Week 4): `syscall`/`sysret` entry on the task's own kernel stack, with the ABI documented in `kernel/src/syscall.rs`; `write(ptr, len)` (to serial, after checking every page of the buffer is mapped user-accessible), `exit(code)` and `yield()`. Unknown numbers and bad pointers return error codes instead of faulting
 - A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`, `gdt_rsp0`, `user_pages`, `ring3_gp`, `ring3_page_fault`, `ring3_preemption`, `ring3_faults`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
 - A `#[test_case]` proving the keyboard handler decodes scancodes correctly (the handler itself works interactively; see the "Done" table below)
 - Clearing the bootloader's leftover lower-half identity mapping (PML4[0]) before per-process page tables (see the "Done" table below)
-- Per-process address spaces, syscalls, and a shell (capstone-proper deliverables). Ring 3 exists but every user task shares one user image and page table; kernel tasks are threads on that same table, and their stacks have no guard page (an overflow is only caught by a canary check at switch time)
+- Per-process address spaces and a shell (capstone-proper deliverables). Ring 3 exists but every user task shares one user image and page table; kernel tasks are threads on that same table, and their stacks have no guard page (an overflow is only caught by a canary check at switch time)
 
 If something in the code looks unfinished or stubbed, it probably is — this project is under active, weekly development. Check the commit history rather than assuming this list is current by the time you read it.
 
  **Done**
 
-Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (kernel-thread scheduling, Ring 3, syscalls, a shell) started 2026-10-05; only the kernel-thread scheduling (Weeks 1-2) and Ring 3 entry/fault-handling (Layer 5 Week 3) groundwork, in the bullets above and the "Testing" list below, exists so far and isn't evaluated in these tables.
+Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (kernel-thread scheduling, Ring 3, syscalls, a shell) started 2026-10-05; only the kernel-thread scheduling (Weeks 1-2), Ring 3 entry/fault-handling (Layer 5 Week 3) and syscall (Week 4) groundwork, in the bullets above and the "Testing" list below, exists so far and isn't evaluated in these tables.
 
 Current test suite backing all the "proven" claims below: **70 tests across 22 test binaries** (the `lib` and `main` unit-test binaries plus 20 integration binaries) (`cargo test` from `kernel/`), all passing as of this check.
 
@@ -98,7 +99,7 @@ Current test suite backing all the "proven" claims below: **70 tests across 22 t
 | `alloc` crate usable | Done | `extern crate alloc;` in `lib.rs`; no explicit `#[alloc_error_handler]` — this toolchain's default OOM-abort behavior (stable since ~Rust 1.68) covers it, confirmed by a clean `cargo build` with no missing-lang-item error |
 | Proven working | Done | 7 `#[test_case]`s in `kernel/src/allocator.rs` (`Box`/`Vec` round-trips, a 10,000-cycle stress test, an alignment audit, a fragmentation check) plus 3 more in the dedicated-boot `kernel/tests/heap_allocation.rs` (`Box`, `Vec`, `String`) |
 
-**Not evaluated (out of scope, Layer 4+):** the Week 1-2 kernel-thread scheduler (`task.rs`, `context.rs`, `scheduler.rs`) and the Week 3 Ring 3 support (`user.rs`, the GDT user segments) are covered only by their integration tests, not by the tables above; syscalls and a shell don't exist in the repo yet — not a gap in this checklist, just outside what pre-capstone is claiming.
+**Not evaluated (out of scope, Layer 4+):** the Week 1-2 kernel-thread scheduler (`task.rs`, `context.rs`, `scheduler.rs`) the Week 3 Ring 3 support (`user.rs`, the GDT user segments) and the Week 4 syscalls (`syscall.rs`) are covered only by their integration tests, not by the tables above; a shell doesn't exist in the repo yet — not a gap in this checklist, just outside what pre-capstone is claiming.
 
 ## Architecture
 
@@ -125,7 +126,8 @@ Two independent Cargo projects live in this repo:
         ├── task.rs       # Task/TaskId, heap-backed stacks
         ├── context.rs    # naked context switch, new-task trampoline
         ├── scheduler.rs  # round-robin run queue, spawn/yield/exit, timer preemption hook, per-task RSP0
-        └── user.rs       # Ring 3 image mapping, spawn_user/enter_user
+        ├── user.rs       # Ring 3 image mapping, spawn_user/enter_user, user-pointer checks
+        └── syscall.rs    # syscall/sysret entry stub, the syscall ABI, write/exit/yield
 ```
 
 **Why two crates:** `kernel` needs its own target spec, its own `build-std` configuration, and `no_std`. Keeping it a fully separate Cargo project (its own `target/` directory, its own `.cargo/config.toml`) avoids a workspace deadlock where a nested `cargo build` inside `build.rs` blocks on the same build lock as the outer build.
@@ -179,6 +181,10 @@ Tests run inside the actual kernel environment rather than on the host, since mo
   - `user_pages.rs` — user mappings are `USER_ACCESSIBLE` at every level, stack is NX, kernel pages stay supervisor-only
   - `ring3_gp.rs`, `ring3_page_fault.rs`, `ring3_faults.rs` — privilege violations from Ring 3 are caught, kill only the offending task, and the kernel carries on
   - `ring3_preemption.rs` — a spinning Ring 3 task is preempted by the timer tick
+  - `syscall_entry.rs` — a Ring 3 `syscall` comes back at CPL 3 with a result in `rax` and every preserved register intact, and the handler runs as mainline code on the task's kernel stack
+  - `syscall_dispatch.rs` — unknown syscall numbers return an error and the program keeps running
+  - `syscall_write.rs` — `write` prints a valid user buffer and rejects kernel, non-canonical, wrapping, unmapped and straddling ranges
+  - `syscall_exit_yield.rs` — the W4 deliverable: one user program writes, yields to a kernel task, writes again and exits with a code, in an exact interleaving, with its stack reaped
 
 A test binary reports success or failure by writing an exit code to QEMU's `isa-debug-exit` I/O port; `runner` reads QEMU's process exit code and translates it back into something `cargo test` understands.
 
