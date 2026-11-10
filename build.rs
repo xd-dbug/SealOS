@@ -13,6 +13,22 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", kernel_dir.join("src").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join("Cargo.toml").display());
+    println!("cargo:rerun-if-changed={}", kernel_dir.join("build.rs").display());
+    // The kernel embeds the user programs (`kernel/build.rs`), so they are
+    // kernel inputs too. Cargo only reruns this script for paths listed
+    // here, never for the kernel's own `rerun-if-changed` list. Inputs only,
+    // not `user/target`, which changes on every build.
+    let user_dir = manifest_dir.join("user");
+    for input in [
+        "src",
+        "Cargo.toml",
+        "build.rs",
+        "linker.ld",
+        "x86_64-seal_os-user.json",
+        ".cargo/config.toml",
+    ] {
+        println!("cargo:rerun-if-changed={}", user_dir.join(input).display());
+    }
 
     let mut cmd = Command::new(env::var_os("CARGO").unwrap());
     cmd.current_dir(&kernel_dir);

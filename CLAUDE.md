@@ -9,7 +9,7 @@ clone the agents in "Available subagents" below won't exist.
 
 ## Repo layout
 
-Two crates, not a Cargo workspace (both `edition = "2024"`):
+Three crates, not a Cargo workspace (all `edition = "2024"`):
 
 - **Root (`Cargo.toml`, name `runner`)** — a normal `std` host binary. Its `build.rs`
   cross-compiles `kernel/` to the custom bare-metal target; its `src/main.rs` builds a UEFI disk
@@ -21,6 +21,14 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
   built with `build-std = ["core", "compiler_builtins", "alloc"]` and
   `build-std-features = ["compiler-builtins-mem"]`. `alloc` is what makes `Box`/`Vec`/`String`
   usable on top of the kernel heap.
+- **`user/` (package `seal_user`)** — user programs (Layer 5 W5). Own target spec
+  `user/x86_64-seal_os-user.json` (softfloat like the kernel, but small code model + PIC, red zone
+  on) and `user/linker.ld` (static non-PIE `ET_EXEC` at `USER_ELF_BASE = 0x80_0040_0000`, one
+  page-aligned `PT_LOAD` each for R-X, R--, RW-). `src/lib.rs` is the runtime (syscall wrappers
+  mirroring `syscall.rs`'s ABI, `print!`, a panic handler that exits 101, `entry!` for a naked
+  `_start`); `src/bin/*.rs` are the programs. `kernel/build.rs` builds it (nested `cargo build
+  --release` with its own `--target-dir user/target`, never the kernel's: the outer cargo holds
+  that lock) and `kernel/src/programs.rs` embeds the result with `include_bytes!`.
 
 ## Build / run / test
 
@@ -30,6 +38,8 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
   so on a clean checkout run `cargo build` (or `cargo run`) from the repo root first. Each test
   binary boots in its own QEMU instance; results are reported over a virtual serial port and via
   QEMU's `isa-debug-exit` device, translated back into a normal 0/1 process exit code for cargo.
+  `cargo test` from the repo root runs the one host-side test, `tests/user_elf.rs` (checks the
+  built user ELF with `readelf`, so needs binutils).
   For the full exit-code plumbing and how to tell a real test failure apart from a triple fault
   or hang, see the `qemu-test-diagnostician` agent below.
 - Requires a pinned nightly toolchain (`rust-toolchain.toml`: `nightly-2026-07-19`, includes
@@ -138,13 +148,26 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
     page `PRESENT | USER_ACCESSIBLE` at all four levels, `MAPPER` held across the read) to serial,
     plus a test-only `syscall::set_write_tap`. `SYS_EXIT` → `scheduler::exit` and bumps
     `user_exits()`/`last_exit_code()`, separate from `user_faults()`.
+- **ELF loading (Layer 5 W5)**: `kernel/src/elf.rs` validates a file as untrusted input,
+  allocation-free (fixed `[LoadSegment; MAX_LOAD_SEGMENTS = 4]`, reads fields byte-wise since
+  `include_bytes!` data is align 1): ELF64/LE/`ET_EXEC`/`EM_X86_64`, phdr table in bounds,
+  `PT_INTERP`/`PT_DYNAMIC` rejected, and per `PT_LOAD` `filesz <= memsz`, in-file, page-congruent,
+  no `vaddr + memsz` overflow, inside `USER_CODE_START..USER_SPACE_END` (PML4[1] up), clear of the
+  stack, not W+X, ascending with no shared page, `MAX_IMAGE_PAGES = 256` total; `e_entry` in an
+  executable segment. One `ElfError` variant per check. `user::load_elf(&Elf)` /
+  `spawn_user_elf(bytes)` map it through `user::map_image`, which `map_user_program` (raw asm,
+  now a one-segment image) shares: leaf flags from `p_flags`, each frame zeroed and filled through
+  the phys-offset map *before* `map_to`, rollback to nothing mapped on failure, the mapped
+  segment pages recorded in `LOADED` so the next load frees exactly those (plus the fixed stack),
+  and the entry point stored in `ENTRY` for the argument-less `user_task_entry`. A file that fails
+  `parse` never reaches the page tables. The stack is still the fixed W3 one, below the ELF.
 - **Text output**: the kernel renders text by software-blitting glyphs onto a UEFI GOP pixel
   framebuffer (`kernel/src/framebuffer.rs`, via `noto-sans-mono-bitmap`), not the legacy VGA text
   buffer at `0xb8000` — that address doesn't exist under a UEFI-only `bootloader` 0.11+ setup. See
   `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md` for the full rationale (this one
   file *is* tracked in git despite `/docs` being gitignored — it was committed before the ignore
   rule). Serial output (`kernel/src/serial.rs`, `uart_16550`) is what tests report through.
-- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus twenty-four
+- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus twenty-six
   integration test binaries under `kernel/tests/`, each with different semantics. Six
   (`should_panic`, `stack_overflow`, `page_fault`, `isr_heap_safety`, `general_protection`,
   `ring3_page_fault`) set `harness = false` in
@@ -201,6 +224,14 @@ Two crates, not a Cargo workspace (both `edition = "2024"`):
   - `syscall_exit_yield.rs` — full init, preemption off; the W4 deliverable: write, yield, write,
     exit(42) interleaved with a kernel task (`1a2b`), exit code recorded, `user_faults()`
     unchanged, stack reaped back to the heap baseline.
+  - `elf_loader.rs` — full init; #50: `load_elf` leaf flags follow `p_flags` (text not W, data
+    NX), file bytes copied and `.bss`/page tails zero (also after dirtying and reloading), entry
+    from `e_entry`, a reload reuses exactly the freed frames, a rejected file leaves the image
+    alone, and switching between raw and ELF loads unmaps the other image.
+  - `elf_exec.rs` — full init, preemption off; the W5 deliverable: a corrupted copy is rejected
+    before anything is mapped, then the embedded `hello` ELF runs at Ring 3, its writes reach the
+    tap, it checks its own `.data`/`.bss` statics and exits 42, `user_faults()` unchanged, stack
+    reaped to the heap baseline.
   - `preemption.rs` — full init, preemption on; the W2 deliverable proof: CPU-bound
     never-yielding tasks hit exact totals within a tick budget, all GPRs survive preemption, heap
     churn, fresh-task IF, preemption-off never switches, and cooperative + preempted tasks mixed.
@@ -218,7 +249,9 @@ Layer 5 W3 24–29 (single shared user image, `spawn_user` vs. a live user task,
 CPL 0 `#PF` halts, DS/ES left as user data [27, addressed for syscalls], `USER_FAULTS` vs.
 `sys_exit` [28, addressed]), and W4 30–34 (single-CPU syscall slots, `with_user_bytes` holding
 `MAPPER`/reading in place, no test for the non-canonical-`sysret` kill, no per-process exit
-status or fd, and missing exception handlers that let Ring 3 escalate to a `#DF` panic). Item 6's
+status or fd, and missing exception handlers that let Ring 3 escalate to a `#DF` panic), and W5 35–37 (fixed
+user stack outside the ELF with no argv/auxv, the shared `LOADED`/`ENTRY` single-image globals,
+hand-copied `USER_ELF_BASE`/syscall numbers between `user/` and the kernel). Item 6's
 heap-in-ISR hazard and item 9 (`#GP` handler) are addressed. Unlike the spec above, this file is untracked (`/docs` is gitignored), so
 it's a local reference only and won't exist on a fresh clone.
 
@@ -232,7 +265,7 @@ it's a local reference only and won't exist on a fresh clone.
 - Shared/static state uses `lazy_static!` + `spin::Mutex`/`conquer_once::spin::OnceCell`, not bare
   `static mut`. Other sanctioned forms: atomics (`TICKS`, `ISR_DEPTH`, `PREEMPTION`, `USER_FAULTS`, and
   `syscall.rs`'s `KERNEL_STACK`/`USER_RSP`, which the entry stub reads/writes as plain `u64`s via
-  `sym`, plus `USER_EXITS`/`LAST_EXIT_CODE`), `gdt.rs`'s `Tss(UnsafeCell<..>)` wrapper (the CPU reads the TSS directly; written only with IF=0), the
+  `sym`, plus `USER_EXITS`/`LAST_EXIT_CODE` and `user.rs`'s `ENTRY`), `gdt.rs`'s `Tss(UnsafeCell<..>)` wrapper (the CPU reads the TSS directly; written only with IF=0), the
   `#[global_allocator]` `GuardedHeap` (its `LockedHeap` has its own internal lock), and test-local `lazy_static!` IDTs in integration tests. The one `static mut` exception,
   `gdt.rs`'s IST guard stack, is accessed only via `&raw const`/`&raw mut`, never a reference —
   see `kernel-safety-reviewer` for the full rule.

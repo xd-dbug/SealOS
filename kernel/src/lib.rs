@@ -26,6 +26,8 @@ pub mod context;
 pub mod scheduler;
 pub mod user;
 pub mod syscall;
+pub mod elf;
+pub mod programs;
 
 /// Start of the upper (kernel) half of the canonical address space. Everything
 /// the kernel owns lives at or above this so the whole lower half

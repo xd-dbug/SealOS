@@ -1,0 +1,8 @@
+[unstable]
+json-target-spec = true
+build-std = ["core", "compiler_builtins"]
+# `memcpy`/`memset` for core; there is no libc underneath.
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target = "x86_64-seal_os-user.json"
