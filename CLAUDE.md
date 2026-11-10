@@ -26,7 +26,8 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
   on) and `user/linker.ld` (static non-PIE `ET_EXEC` at `USER_ELF_BASE = 0x80_0040_0000`, one
   page-aligned `PT_LOAD` each for R-X, R--, RW-). `src/lib.rs` is the runtime (syscall wrappers
   mirroring `syscall.rs`'s ABI, `print!`, a panic handler that exits 101, `entry!` for a naked
-  `_start`); `src/bin/*.rs` are the programs. `kernel/build.rs` builds it (nested `cargo build
+  `_start`); `src/line.rs` is the shell's syscall-free line editor and parser (W6, tested on the
+  host); `src/bin/*.rs` are the programs (`hello`, `shell`). `kernel/build.rs` builds it (nested `cargo build
   --release` with its own `--target-dir user/target`, never the kernel's: the outer cargo holds
   that lock) and `kernel/src/programs.rs` embeds the result with `include_bytes!`.
 
@@ -38,8 +39,9 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
   so on a clean checkout run `cargo build` (or `cargo run`) from the repo root first. Each test
   binary boots in its own QEMU instance; results are reported over a virtual serial port and via
   QEMU's `isa-debug-exit` device, translated back into a normal 0/1 process exit code for cargo.
-  `cargo test` from the repo root runs the one host-side test, `tests/user_elf.rs` (checks the
-  built user ELF with `readelf`, so needs binutils).
+  `cargo test` from the repo root runs the two host-side tests: `tests/user_elf.rs` (checks the
+  built user ELFs with `readelf`, so needs binutils) and `tests/shell_line.rs` (the shell's
+  editor/parser, `user/src/line.rs` included with `#[path]`).
   For the full exit-code plumbing and how to tell a real test failure apart from a triple fault
   or hang, see the `qemu-test-diagnostician` agent below.
 - Requires a pinned nightly toolchain (`rust-toolchain.toml`: `nightly-2026-07-19`, includes
@@ -115,7 +117,8 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
   heap lock only under `without_interrupts`. `ISR_DEPTH` describes the running context, so an
   ISR-driven task switch goes through `interrupts::switch_from_isr` (swap to 0 → `switch` →
   restore), never a plain `switch` or an early guard drop. An ISR may take only locks mainline
-  holds with IF=0 (`SCHEDULER`, and `PICS`, so any mainline `PICS.lock()` after `sti` needs
+  holds with IF=0 (`SCHEDULER`, `input.rs`'s `INPUT`, the framebuffer `WRITER` for the exception
+  handlers that print, and `PICS`, so any mainline `PICS.lock()` after `sti` needs
   `without_interrupts`), and sends EOI before switching. A `#GP`/`#PF` from CPL 3 retires the
   task instead of panicking: `kill_user_task` → `scheduler::exit_from_isr` (same `ISR_DEPTH`
   hand-off via `switch_from_isr`; frees nothing, `reap` frees later) and bumps `user_faults()`.
@@ -136,7 +139,8 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
     DS/ES = user data). SMAP/SMEP are off (kernel reads user memory freely).
 - **Syscalls (Layer 5 W4)**: `kernel/src/syscall.rs` holds the ABI table (number in `rax`, args
   `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9`, result in `rax`, errors as negated `SyscallError`, only
-  `rcx`/`r11` clobbered; `SYS_WRITE` 1, `SYS_EXIT` 2, `SYS_YIELD` 3, 0 reserved).
+  `rcx`/`r11` clobbered; `SYS_WRITE` 1, `SYS_EXIT` 2, `SYS_YIELD` 3, `SYS_READ` 4, `SYS_UPTIME` 5,
+  0 reserved).
   - `syscall_entry` (naked, LSTAR) runs with SFMASK's IF/TF/DF/AC/NT cleared, parks the user RSP
     in a global slot, loads `KERNEL_STACK` (mirrored from RSP0 by `rotate` via
     `syscall::set_kernel_stack`), pushes a `SyscallFrame`, reloads kernel DS/ES, `sti`, calls
@@ -145,8 +149,8 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
     A non-canonical return RIP kills the task instead of `sysretq` (counted in `user_faults()`).
     Kernel code must never execute `syscall`.
   - `SYS_WRITE` goes through `user::with_user_bytes` (no overflow, below `USER_SPACE_END`, every
-    page `PRESENT | USER_ACCESSIBLE` at all four levels, `MAPPER` held across the read) to serial,
-    plus a test-only `syscall::set_write_tap`. `SYS_EXIT` → `scheduler::exit` and bumps
+    page `PRESENT | USER_ACCESSIBLE` at all four levels, `MAPPER` held across the read) to serial
+    and the framebuffer console (W6), plus a test-only `syscall::set_write_tap`. `SYS_EXIT` → `scheduler::exit` and bumps
     `user_exits()`/`last_exit_code()`, separate from `user_faults()`.
 - **ELF loading (Layer 5 W5)**: `kernel/src/elf.rs` validates a file as untrusted input,
   allocation-free (fixed `[LoadSegment; MAX_LOAD_SEGMENTS = 4]`, reads fields byte-wise since
@@ -161,18 +165,42 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
   segment pages recorded in `LOADED` so the next load frees exactly those (plus the fixed stack),
   and the entry point stored in `ENTRY` for the argument-less `user_task_entry`. A file that fails
   `parse` never reaches the page tables. The stack is still the fixed W3 one, below the ELF.
+- **Shell and keyboard input (Layer 6 W6)**:
+  - `kernel/src/input.rs` — the keyboard ISR no longer prints; `push_key` maps a `DecodedKey` to
+    bytes (Enter `\n`, Backspace `0x08`, Unicode as UTF-8, `\r` folded to `\n`, `RawKey`s
+    dropped) into a fixed 256-byte ring behind a const-initialized `spin::Mutex` (two producers,
+    the ISR and the test hook `input::inject`, so not a lock-free SPSC ring), every access under
+    `without_interrupts`. Full buffer: the **newest** key is dropped, whole (never half a UTF-8
+    sequence), and counted in `dropped()`. Echo is the reader's job.
+  - `SYS_READ(ptr, len)` — `user::with_user_bytes_mut` requires `PRESENT | USER_ACCESSIBLE |
+    WRITABLE` at all four levels (so `read` can't be aimed at read-only text) and validates
+    *before* any input is taken; a bad pointer returns `BadAddress` and eats no keystroke. With
+    nothing buffered it blocks by polling: `yield_now` in a loop with no lock held (no wait
+    queues); `len == 0` returns 0 at once. `SYS_UPTIME` returns `interrupts::uptime_ms()`.
+  - Console: `framebuffer::Writer` treats `\x08` as cursor-back-one-cell (stops at column 0,
+    like a VT100; erasing is `"\x08 \x08"`), and exposes `framebuffer::cursor()`/`columns()` (in
+    character cells) for tests. Still no scrolling: a full screen is cleared.
+  - `user/src/bin/shell.rs` (embedded as `programs::SHELL`) — prompt `seal> `, reads through
+    `SYS_READ`, echoes what the line editor accepts, built-ins `help`, `echo`, `uptime`, `exit
+    [code]` from one `BUILTINS` table; unknown names print `<name>: command not found`. The
+    editor (`user/src/line.rs`) is ASCII-only with a fixed 100-byte line and 16 arguments; no
+    `run <program>` (single shared image).
+  - `kernel_main` → `run_shell`: spawns the shell and turns the boot task into the idle task
+    (`yield_now` + `hlt`). A clean `exit` is reported and a new shell started; a shell killed by
+    a fault is not restarted.
 - **Text output**: the kernel renders text by software-blitting glyphs onto a UEFI GOP pixel
   framebuffer (`kernel/src/framebuffer.rs`, via `noto-sans-mono-bitmap`), not the legacy VGA text
   buffer at `0xb8000` — that address doesn't exist under a UEFI-only `bootloader` 0.11+ setup. See
   `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md` for the full rationale (this one
   file *is* tracked in git despite `/docs` being gitignored — it was committed before the ignore
   rule). Serial output (`kernel/src/serial.rs`, `uart_16550`) is what tests report through.
-- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus twenty-six
+- **Testing**: unit tests (`#[test_case]`) in the `lib.rs` and `main.rs` test binaries, plus thirty
   integration test binaries under `kernel/tests/`, each with different semantics. Six
   (`should_panic`, `stack_overflow`, `page_fault`, `isr_heap_safety`, `general_protection`,
   `ring3_page_fault`) set `harness = false` in
   `kernel/Cargo.toml`; the rest use the normal custom test harness. Tests that assert an exact
-  interleaving (`cooperative_yield`, `run_queue`, `task_exit`, `syscall_exit_yield`) call
+  interleaving (`cooperative_yield`, `run_queue`, `task_exit`, `syscall_exit_yield`, `elf_exec`, `console`,
+  `syscall_read`, `shell_session`) call
   `scheduler::set_preemption(false)` after `kernel::init()`; a tick would otherwise reorder them. **Heap-allocating tests must go in an integration
   binary, not the lib unit-test binary**: the `memory.rs` frame-allocator tests corrupt the lib
   binary's heap for any test that runs after them (design-review item 15).
@@ -217,8 +245,9 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
     result in `rax` and every preserved register, RSP and DS intact; a `SYS_WRITE` tap checks the
     handler runs mainline (IF=1, no ISR depth, kernel DS/ES, DF clear, on the task's kernel stack)
     and that the user's DF comes back.
-  - `syscall_dispatch.rs` — full init; unknown numbers (0, 4, huge) return `NoSuchSyscall` and the
-    program keeps running.
+  - `syscall_dispatch.rs` — full init; unknown numbers (0, 6, huge) return `NoSuchSyscall` and the
+    program keeps running; `SYS_UPTIME` next to them still dispatches. The "first unused" number
+    moves whenever a syscall is added.
   - `syscall_write.rs` — full init; a valid buffer reaches the write tap; kernel, non-canonical,
     first-non-user, wrapping, unmapped and page-straddling ranges return `BadAddress`.
   - `syscall_exit_yield.rs` — full init, preemption off; the W4 deliverable: write, yield, write,
@@ -232,6 +261,20 @@ Three crates, not a Cargo workspace (all `edition = "2024"`):
     before anything is mapped, then the embedded `hello` ELF runs at Ring 3, its writes reach the
     tap, it checks its own `.data`/`.bss` statics and exits 42, `user_faults()` unchanged, stack
     reaped to the heap baseline.
+  - `input_buffer.rs` — full init; #52: FIFO order (also across wraparound), an empty or drained
+    buffer reads nothing, a full one drops the newest byte and keeps the rest, a multi-byte key
+    is never split, and `push_key`'s key-to-byte mapping.
+  - `console.rs` — full init, preemption off; #54: the console cursor after text, newline,
+    backspace, the rub-out sequence, backspace at column 0 and across a wrapped line, and after
+    a Ring 3 `SYS_WRITE`.
+  - `syscall_read.rs` — full init, preemption off; #53: kernel, non-canonical, read-only-code,
+    past-the-stack and wrapping buffers return `BadAddress` with input waiting and consume none
+    of it (the good reads then get all of it, in order), short reads, `len == 0`, and a read
+    with nothing buffered blocks until another task injects input.
+  - `shell_session.rs` — full init, preemption off; the W6 deliverable: scripted keys through
+    `input::inject` (some pre-buffered, some while the shell is blocked) against the embedded
+    shell; the write-tap transcript matches exactly (echo, rub-out, unknown command, `help`),
+    `exit 7` is recorded, `user_faults()` unchanged, stack reaped to the heap baseline.
   - `preemption.rs` — full init, preemption on; the W2 deliverable proof: CPU-bound
     never-yielding tasks hit exact totals within a tick budget, all GPRs survive preemption, heap
     churn, fresh-task IF, preemption-off never switches, and cooperative + preempted tasks mixed.
@@ -251,7 +294,11 @@ CPL 0 `#PF` halts, DS/ES left as user data [27, addressed for syscalls], `USER_F
 `MAPPER`/reading in place, no test for the non-canonical-`sysret` kill, no per-process exit
 status or fd, and missing exception handlers that let Ring 3 escalate to a `#DF` panic), and W5 35–37 (fixed
 user stack outside the ELF with no argv/auxv, the shared `LOADED`/`ENTRY` single-image globals,
-hand-copied `USER_ELF_BASE`/syscall numbers between `user/` and the kernel). Item 6's
+hand-copied `USER_ELF_BASE`/syscall numbers between `user/` and the kernel), and W6 38–43
+(`SYS_READ` polls instead of sleeping on a wait queue, one global input buffer with no owner,
+EOF or control keys, console limits [no scroll, backspace stops at column 0, ASCII-only editor],
+the shell can't run programs and its respawn policy lives in `kernel_main`, `SYS_WRITE` blits
+glyphs with `MAPPER` held and IF=0, and the real IRQ1/scancode path has no automated test). Item 6's
 heap-in-ISR hazard and item 9 (`#GP` handler) are addressed. Unlike the spec above, this file is untracked (`/docs` is gitignored), so
 it's a local reference only and won't exist on a fresh clone.
 
@@ -265,7 +312,7 @@ it's a local reference only and won't exist on a fresh clone.
 - Shared/static state uses `lazy_static!` + `spin::Mutex`/`conquer_once::spin::OnceCell`, not bare
   `static mut`. Other sanctioned forms: atomics (`TICKS`, `ISR_DEPTH`, `PREEMPTION`, `USER_FAULTS`, and
   `syscall.rs`'s `KERNEL_STACK`/`USER_RSP`, which the entry stub reads/writes as plain `u64`s via
-  `sym`, plus `USER_EXITS`/`LAST_EXIT_CODE` and `user.rs`'s `ENTRY`), `gdt.rs`'s `Tss(UnsafeCell<..>)` wrapper (the CPU reads the TSS directly; written only with IF=0), the
+  `sym`, plus `USER_EXITS`/`LAST_EXIT_CODE`, `user.rs`'s `ENTRY` and `input.rs`'s `DROPPED`), a const-initialized `spin::Mutex` where no lazy init is needed (`PICS`, `input.rs`'s `INPUT`), `gdt.rs`'s `Tss(UnsafeCell<..>)` wrapper (the CPU reads the TSS directly; written only with IF=0), the
   `#[global_allocator]` `GuardedHeap` (its `LockedHeap` has its own internal lock), and test-local `lazy_static!` IDTs in integration tests. The one `static mut` exception,
   `gdt.rs`'s IST guard stack, is accessed only via `&raw const`/`&raw mut`, never a reference —
   see `kernel-safety-reviewer` for the full rule.
@@ -279,7 +326,8 @@ finished tutorial layers.
   framebuffer + serial output, GDT/IDT + CPU exceptions, hardware interrupts
   (PIC/keyboard/timer), physical memory manager, paging/virtual memory, kernel heap allocator.
 - **Layer 4+ (current focus):** process control blocks, context switching, scheduling,
-  Ring 3 / privilege separation, syscalls, shell.
+  Ring 3 / privilege separation, syscalls, shell (W6: a minimal one exists, see "Shell and
+  keyboard input" above).
 
 Completion status is tracked on the project board (below) and in the burndown sheet and proposal
 doc (outside this repo) — not in this file. If status matters for a task, check the board or ask

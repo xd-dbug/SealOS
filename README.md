@@ -16,21 +16,22 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - Ring 3 (Layer 5, Week 3): one user image (code + NX stack) mapped in PML4[1] with `USER_ACCESSIBLE`, entered via `iretq` from an ordinary scheduled task; the timer preempts it, and a `#GP`/`#PF` from Ring 3 kills only that task. All tasks share one user image and one page table
 - Syscalls (Layer 5, Week 4): `syscall`/`sysret` entry on the task's own kernel stack, with the ABI documented in `kernel/src/syscall.rs`; `write(ptr, len)` (to serial, after checking every page of the buffer is mapped user-accessible), `exit(code)` and `yield()`. Unknown numbers and bad pointers return error codes instead of faulting
 - User ELF programs (Layer 5, Week 5): a separate `user/` crate (own target spec and linker script, static non-PIE `ET_EXEC` with R-X / R-- / RW- segments) is built by `kernel/build.rs` and embedded with `include_bytes!`; `kernel/src/elf.rs` validates it as untrusted input (allocation-free, one error per check, W^X enforced) and `user::spawn_user_elf` maps its segments with per-segment permissions and runs it from `e_entry`
-- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`, `gdt_rsp0`, `user_pages`, `ring3_gp`, `ring3_page_fault`, `ring3_preemption`, `ring3_faults`, `syscall_entry`, `syscall_dispatch`, `syscall_write`, `syscall_exit_yield`, `elf_loader`, `elf_exec`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
+- A shell (Layer 6, Week 6): the keyboard ISR queues decoded keys in a fixed, allocation-free buffer instead of printing them; `read(ptr, len)` hands them to Ring 3 (blocking while none are waiting, and refusing any buffer the program itself couldn't write); `write` now also draws on the framebuffer console, which understands backspace. `cargo run` boots into `user/src/bin/shell.rs`: a `seal> ` prompt, line editing with backspace, and the built-ins `help`, `echo`, `uptime` and `exit [code]`
+- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`, `gdt_rsp0`, `user_pages`, `ring3_gp`, `ring3_page_fault`, `ring3_preemption`, `ring3_faults`, `syscall_entry`, `syscall_dispatch`, `syscall_write`, `syscall_exit_yield`, `elf_loader`, `elf_exec`, `input_buffer`, `console`, `syscall_read`, `shell_session`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
-- A `#[test_case]` proving the keyboard handler decodes scancodes correctly (the handler itself works interactively; see the "Done" table below)
+- A test that drives the real keyboard IRQ with scancodes (everything after decoding is tested through `input::push_key`/`inject`; the handler itself works interactively; see the "Done" table below)
 - Clearing the bootloader's leftover lower-half identity mapping (PML4[0]) before per-process page tables (see the "Done" table below)
-- Per-process address spaces and a shell (capstone-proper deliverables). Ring 3 exists but every user task shares one user image and page table; kernel tasks are threads on that same table, and their stacks have no guard page (an overflow is only caught by a canary check at switch time)
+- Per-process address spaces, and so a shell that can run other programs (the shell has built-ins only). Ring 3 exists but every user task shares one user image and page table; kernel tasks are threads on that same table, and their stacks have no guard page (an overflow is only caught by a canary check at switch time)
 
 If something in the code looks unfinished or stubbed, it probably is — this project is under active, weekly development. Check the commit history rather than assuming this list is current by the time you read it.
 
  **Done**
 
-Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (kernel-thread scheduling, Ring 3, syscalls, a shell) started 2026-10-05; only the kernel-thread scheduling (Weeks 1-2), Ring 3 entry/fault-handling (Layer 5 Week 3) and syscall (Week 4) groundwork, in the bullets above and the "Testing" list below, exists so far and isn't evaluated in these tables.
+Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (kernel-thread scheduling, Ring 3, syscalls, a shell) started 2026-10-05; that work (kernel-thread scheduling in Weeks 1-2, Ring 3 in Week 3, syscalls in Week 4, ELF loading in Week 5, the shell in Week 6) is described in the bullets above and the "Testing" list below and isn't evaluated in these tables.
 
-Current test suite backing all the "proven" claims below: **70 tests across 22 test binaries** (the `lib` and `main` unit-test binaries plus 20 integration binaries) (`cargo test` from `kernel/`), all passing as of this check.
+Current test suite backing all the "proven" claims below: **110 tests across 32 test binaries** (the `lib` and `main` unit-test binaries plus 30 integration binaries: 104 `#[test_case]`s, and the six `harness = false` binaries counting one each) (`cargo test` from `kernel/`), all passing as of this check.
 
 **1. Bootloader / boot handoff** — done:
 
@@ -46,7 +47,7 @@ Current test suite backing all the "proven" claims below: **70 tests across 22 t
 | Item | Status | Evidence |
 |---|---|---|
 | UEFI GOP framebuffer text writer | Done | `framebuffer.rs`: software glyph blitting via `noto-sans-mono-bitmap`, not legacy VGA text mode (unavailable under UEFI/GOP — see `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md`) |
-| `print!`/`println!` macros | Done | `framebuffer.rs`, guarded with `without_interrupts` so the timer ISR's own `print!` can't deadlock against a held lock |
+| `print!`/`println!` macros | Done | `framebuffer.rs`, guarded with `without_interrupts` so an exception handler's own `print!` can't deadlock against a held lock |
 | Serial output over COM1 | Done | `serial.rs` via `uart_16550`; `serial_print!`/`serial_println!` macros, same `without_interrupts` guard |
 | Proven working | Done | `test_println_simple`, `test_println_many` (`framebuffer.rs`); serial output additionally exercised implicitly by every integration test's `[ok]`/`[failed]` report |
 
@@ -67,7 +68,7 @@ Current test suite backing all the "proven" claims below: **70 tests across 22 t
 |---|---|---|
 | PIC remapping (vectors 32/40, off the colliding BIOS defaults) | Done | `interrupts.rs`'s `PIC_1_OFFSET`/`PIC_2_OFFSET`, `PICS.lock().initialize()` in `kernel::init()` |
 | Timer (IRQ0) handler + EOI | Done | `timer_interrupt_handler`, `AtomicU64` tick counter, PIT programmed to 100 Hz by `init_pit`; proven by `test_timer_ticks_increase` (and, for preemption, `kernel/tests/preemption.rs`) |
-| Keyboard (IRQ1) handler + EOI | Implemented, not test-proven | `keyboard_interrupt_handler` decodes PS/2 scancodes via `pc-keyboard` and prints the result — works interactively (`cargo run`), but no `#[test_case]` injects a scancode and asserts on the decoded output, unlike every other subsystem here |
+| Keyboard (IRQ1) handler + EOI | Implemented, partly test-proven | `keyboard_interrupt_handler` decodes PS/2 scancodes via `pc-keyboard` and queues the bytes in `input.rs` for `SYS_READ` (it no longer prints) — works interactively (`cargo run`), and `kernel/tests/input_buffer.rs` covers everything from the decoded key onward, but no test injects a raw scancode through the IRQ itself |
 
 **5. Physical memory manager** — fully done:
 
@@ -100,7 +101,7 @@ Current test suite backing all the "proven" claims below: **70 tests across 22 t
 | `alloc` crate usable | Done | `extern crate alloc;` in `lib.rs`; no explicit `#[alloc_error_handler]` — this toolchain's default OOM-abort behavior (stable since ~Rust 1.68) covers it, confirmed by a clean `cargo build` with no missing-lang-item error |
 | Proven working | Done | 7 `#[test_case]`s in `kernel/src/allocator.rs` (`Box`/`Vec` round-trips, a 10,000-cycle stress test, an alignment audit, a fragmentation check) plus 3 more in the dedicated-boot `kernel/tests/heap_allocation.rs` (`Box`, `Vec`, `String`) |
 
-**Not evaluated (out of scope, Layer 4+):** the Week 1-2 kernel-thread scheduler (`task.rs`, `context.rs`, `scheduler.rs`) the Week 3 Ring 3 support (`user.rs`, the GDT user segments) and the Week 4 syscalls (`syscall.rs`) are covered only by their integration tests, not by the tables above; a shell doesn't exist in the repo yet — not a gap in this checklist, just outside what pre-capstone is claiming.
+**Not evaluated (out of scope, Layer 4+):** the Week 1-2 kernel-thread scheduler (`task.rs`, `context.rs`, `scheduler.rs`) the Week 3 Ring 3 support (`user.rs`, the GDT user segments) the Week 4 syscalls (`syscall.rs`), the Week 5 ELF loader and the Week 6 shell (`input.rs`, `user/src/bin/shell.rs`) are covered only by their integration tests, not by the tables above — not a gap in this checklist, just outside what pre-capstone is claiming.
 
 ## Architecture
 
@@ -128,7 +129,8 @@ Three independent Cargo projects live in this repo:
         ├── context.rs    # naked context switch, new-task trampoline
         ├── scheduler.rs  # round-robin run queue, spawn/yield/exit, timer preemption hook, per-task RSP0
         ├── user.rs       # Ring 3 image mapping (raw + ELF), spawn_user/spawn_user_elf/enter_user, user-pointer checks
-        ├── syscall.rs    # syscall/sysret entry stub, the syscall ABI, write/exit/yield
+        ├── syscall.rs    # syscall/sysret entry stub, the syscall ABI, write/exit/yield/read/uptime
+        ├── input.rs      # fixed keyboard input buffer: the ISR pushes, SYS_READ pops
         ├── elf.rs        # allocation-free ELF64 validation
         └── programs.rs   # user programs embedded with include_bytes!
 └── user/                # "seal_user" — Ring 3 programs, built by kernel/build.rs
@@ -136,7 +138,9 @@ Three independent Cargo projects live in this repo:
     ├── linker.ld        # static ET_EXEC at 0x80_0040_0000, one PT_LOAD per permission set
     └── src/
         ├── lib.rs       # syscall wrappers, print!, panic handler, entry! (_start)
-        └── bin/hello.rs # the W5 proof program
+        ├── line.rs      # the shell's line editor and parser (no syscalls; host-tested)
+        ├── bin/hello.rs # the W5 proof program
+        └── bin/shell.rs # the W6 shell: prompt, built-ins
 ```
 
 **Why separate crates:** `kernel` needs its own target spec, its own `build-std` configuration, and `no_std`. Keeping it a fully separate Cargo project (its own `target/` directory, its own `.cargo/config.toml`) avoids a workspace deadlock where a nested `cargo build` inside `build.rs` blocks on the same build lock as the outer build. `user/` is separate for the same reason one level down (`kernel/build.rs` builds it into `user/target`), and because user programs need a different target: linked low in the user half, not at the kernel's address with `code-model: kernel`.
@@ -191,12 +195,16 @@ Tests run inside the actual kernel environment rather than on the host, since mo
   - `ring3_gp.rs`, `ring3_page_fault.rs`, `ring3_faults.rs` — privilege violations from Ring 3 are caught, kill only the offending task, and the kernel carries on
   - `ring3_preemption.rs` — a spinning Ring 3 task is preempted by the timer tick
   - `syscall_entry.rs` — a Ring 3 `syscall` comes back at CPL 3 with a result in `rax` and every preserved register intact, and the handler runs as mainline code on the task's kernel stack
-  - `syscall_dispatch.rs` — unknown syscall numbers return an error and the program keeps running
-  - `syscall_write.rs` — `write` prints a valid user buffer and rejects kernel, non-canonical, wrapping, unmapped and straddling ranges
+  - `syscall_dispatch.rs` — unknown syscall numbers return an error and the program keeps running, and a known one beside them still dispatches
+  - `syscall_write.rs` — `write` prints a valid user buffer (to serial and the framebuffer) and rejects kernel, non-canonical, wrapping, unmapped and straddling ranges
   - `syscall_exit_yield.rs` — the W4 deliverable: one user program writes, yields to a kernel task, writes again and exits with a code, in an exact interleaving, with its stack reaped
   - `elf_loader.rs` — ELF segments are mapped with permissions from `p_flags`, file bytes copied, `.bss` zeroed, and a reload reuses exactly the previous frames
   - `elf_exec.rs` — the W5 deliverable: the embedded `hello` ELF runs at Ring 3, checks its own `.data`/`.bss`, and exits cleanly; a corrupted copy is rejected before anything is mapped
-- **Host test** (`tests/user_elf.rs`, `cargo test` from the repo root) — `readelf` confirms the built user program is a static x86_64 `ET_EXEC` with W^X segments in the user half
+  - `input_buffer.rs` — the keyboard buffer keeps order across wraparound, never returns a stale byte, drops the newest key when full, and maps keys to terminal bytes
+  - `console.rs` — the console cursor after text, newline, backspace (also at column 0), and after a Ring 3 `write`
+  - `syscall_read.rs` — `read` fills a writable user buffer, returns short when less is buffered, blocks until input arrives, and rejects kernel, non-canonical, read-only and straddling buffers without consuming input
+  - `shell_session.rs` — the W6 deliverable: scripted keystrokes drive the embedded shell and the transcript of everything it writes (echo and backspace included) matches exactly; `exit 7` ends it cleanly
+- **Host tests** (`cargo test` from the repo root) — `tests/user_elf.rs`: `readelf` confirms each built user program is a static x86_64 `ET_EXEC` with W^X segments in the user half; `tests/shell_line.rs`: the shell's line editor and parser (`user/src/line.rs`), compiled for the host
 
 A test binary reports success or failure by writing an exit code to QEMU's `isa-debug-exit` I/O port; `runner` reads QEMU's process exit code and translates it back into something `cargo test` understands.
 
