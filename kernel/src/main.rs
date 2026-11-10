@@ -33,7 +33,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         test_main();
 
         #[cfg(not(test))]
-        run_hello();
+        run_shell();
 
         println!("It did not crash!");
     }
@@ -43,20 +43,39 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 bootloader_api::entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
-/// The W5 demo: load the embedded `hello` ELF, run it to completion at
-/// Ring 3, and report its exit code on screen (its own output goes to
-/// serial, through `SYS_WRITE`).
+/// What `cargo run` ends at: the embedded shell at Ring 3, reading the
+/// keyboard through `SYS_READ` and drawing on this same console through
+/// `SYS_WRITE`. The boot task becomes the idle task: it sleeps until the next
+/// interrupt (a key or the tick) and then offers the CPU around, so a shell
+/// blocked in `read` (which polls by yielding) doesn't spin the CPU at 100%.
+///
+/// When the shell ends: a clean `exit` is reported with its code and a fresh
+/// shell is started, like logging out to a new login, since a machine with no
+/// shell has no way to do anything else. A shell killed by a fault is *not*
+/// restarted: whatever broke it would most likely break the next one too, and
+/// a respawn loop would scroll the fault report away. Loading the next shell
+/// here is within the single-image rule (design-review item 25): the previous
+/// one is gone once `ready_count` is 0.
 #[cfg(not(test))]
-fn run_hello() {
+fn run_shell() {
+    use kernel::interrupts::user_faults;
     use kernel::scheduler::{ready_count, yield_now};
-    match kernel::user::spawn_user_elf(kernel::programs::HELLO) {
-        Ok(_) => {
-            while ready_count() > 0 {
-                yield_now();
-            }
-            println!("hello exited with {}", kernel::syscall::last_exit_code());
+
+    loop {
+        let faults = user_faults();
+        if let Err(e) = kernel::user::spawn_user_elf(kernel::programs::SHELL) {
+            println!("shell failed to load: {:?}", e);
+            return;
         }
-        Err(e) => println!("hello failed to load: {:?}", e),
+        while ready_count() > 0 {
+            yield_now();
+            x86_64::instructions::hlt();
+        }
+        if user_faults() != faults {
+            println!("shell was killed by a fault; not restarting it");
+            return;
+        }
+        println!("shell exited with {}; starting a new one", kernel::syscall::last_exit_code());
     }
 }
 

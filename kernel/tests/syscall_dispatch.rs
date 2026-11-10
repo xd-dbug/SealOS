@@ -6,15 +6,20 @@
 
 use bootloader_api::BootInfo;
 use core::panic::PanicInfo;
-use kernel::interrupts::{in_interrupt, ticks, user_faults};
+use kernel::interrupts::{in_interrupt, ticks, uptime_ms, user_faults};
 use kernel::scheduler::{finished_count, yield_now};
-use kernel::syscall::SyscallError;
+use kernel::syscall::{SYS_UPTIME, SyscallError};
 use kernel::user::{USER_STACK_TOP, spawn_user};
 use kernel::{BOOTLOADER_CONFIG, user_program};
 
 // The #39 proof: unknown numbers (the reserved 0, the first unused one, and
 // two far out of range) each come back as an error, and the program keeps
-// running after every one of them to leave its marker.
+// running after every one of them to leave its marker. The first unused
+// number moves whenever a syscall is added (4 and 5 are `SYS_READ` and
+// `SYS_UPTIME` since W6); the assert in the test catches a stale one.
+//
+// The last call is `SYS_UPTIME` (5), the one syscall with no arguments and a
+// plain value back: it must dispatch, not fall into the unknown arm.
 user_program!(
     unknown_program,
     "
@@ -22,7 +27,7 @@ user_program!(
     xor eax, eax
     syscall
     mov [rbx - 8], rax
-    mov eax, 4
+    mov eax, 6
     syscall
     mov [rbx - 16], rax
     mov eax, 0x7fffffff
@@ -31,6 +36,9 @@ user_program!(
     mov rax, -1
     syscall
     mov [rbx - 32], rax
+    mov eax, 5
+    syscall
+    mov [rbx - 48], rax
     mov qword ptr [rbx - 40], 0x600d
     hlt
     "
@@ -66,6 +74,9 @@ fn user_result(n: u64) -> u64 {
 #[test_case]
 fn unknown_syscall_returns_error_and_task_continues() {
     assert_eq!(user_faults(), 0);
+    // The program's `mov eax, 6` must name the first number past the table.
+    assert_eq!(SYS_UPTIME, 5, "a syscall was added: move the test's unused number");
+    let before = uptime_ms();
     spawn_user(unknown_program()).expect("spawn_user failed");
 
     let deadline = ticks() + 300;
@@ -82,6 +93,11 @@ fn unknown_syscall_returns_error_and_task_continues() {
         assert_eq!(user_result(n), no_such, "unknown syscall #{}", n);
     }
     assert_eq!(user_result(5), 0x600d, "program did not keep running");
+
+    // A known number right next to the unknown ones still dispatches: the
+    // uptime it returned lies between the kernel's own readings.
+    let uptime = user_result(6);
+    assert!((before..=uptime_ms()).contains(&uptime), "SYS_UPTIME returned {}", uptime);
 
     assert!(!in_interrupt());
     yield_now();

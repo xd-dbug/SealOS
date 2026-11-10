@@ -29,6 +29,8 @@
 //! | 1      | `SYS_WRITE`       | ptr, len   | bytes written    |
 //! | 2      | `SYS_EXIT`        | code       | does not return  |
 //! | 3      | `SYS_YIELD`       | -          | 0                |
+//! | 4      | `SYS_READ`        | ptr, len   | bytes read (>= 1 unless len is 0; blocks) |
+//! | 5      | `SYS_UPTIME`      | -          | ms since boot    |
 //!
 //! 0 is reserved so a program that forgot to set `rax` (fresh tasks start with
 //! every GPR zeroed, see `user::enter_user`) gets an error, not a write.
@@ -43,6 +45,8 @@ use x86_64::registers::rflags::RFlags;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_EXIT: u64 = 2;
 pub const SYS_YIELD: u64 = 3;
+pub const SYS_READ: u64 = 4;
+pub const SYS_UPTIME: u64 = 5;
 
 /// Why a syscall failed. Returned to Ring 3 as `-(code)`; never a panic or a
 /// kill, since a bad request is the user program's problem, not the kernel's.
@@ -51,7 +55,8 @@ pub const SYS_YIELD: u64 = 3;
 pub enum SyscallError {
     /// `rax` named no syscall.
     NoSuchSyscall = 1,
-    /// A pointer argument wasn't wholly inside mapped, user-accessible memory.
+    /// A pointer argument wasn't wholly inside mapped, user-accessible memory
+    /// (user-*writable* memory, for a buffer the kernel fills).
     BadAddress = 2,
 }
 
@@ -266,13 +271,15 @@ extern "C" fn syscall_handler(frame: *mut SyscallFrame) -> u64 {
 }
 
 /// Number -> handler. Kept as one `match` rather than a table of function
-/// pointers: three entries don't need one, and the compiler checks every
-/// handler's argument use.
+/// pointers: a handful of entries don't need one, and the compiler checks
+/// every handler's argument use.
 fn dispatch(number: u64, args: [u64; 3]) -> Result<u64, SyscallError> {
     match number {
         SYS_WRITE => sys_write(args[0], args[1]),
         SYS_EXIT => sys_exit(args[0]),
         SYS_YIELD => sys_yield(),
+        SYS_READ => sys_read(args[0], args[1]),
+        SYS_UPTIME => sys_uptime(),
         _ => Err(SyscallError::NoSuchSyscall),
     }
 }
@@ -286,9 +293,16 @@ pub fn set_write_tap(tap: Option<fn(&[u8])>) {
     *WRITE_TAP.lock() = tap;
 }
 
-/// `write(ptr, len)`: copies `len` bytes at `ptr` to serial. The range is
-/// checked by `user::with_user_bytes` before a single byte is read, so a bad
-/// pointer is an error, never a kernel `#PF`.
+/// `write(ptr, len)`: copies `len` bytes at `ptr` to serial and to the
+/// framebuffer console, so a program's output shows in the QEMU window and
+/// not just on the host's terminal. The range is checked by
+/// `user::with_user_bytes` before a single byte is read, so a bad pointer is
+/// an error, never a kernel `#PF`.
+///
+/// The framebuffer lock is one an exception handler may take, so it is held
+/// with IF=0: `print!` (`framebuffer::_print`) does that itself. The console
+/// understands `\n` and backspace (`\x08`, cursor back one cell); anything
+/// else without a glyph draws as `?`.
 ///
 /// SMAP is off (design-review item 26), so the kernel can read the bytes
 /// directly. With SMAP on, the read would be bracketed by `stac`/`clac`
@@ -299,8 +313,10 @@ fn sys_write(ptr: u64, len: u64) -> Result<u64, SyscallError> {
         // are the program's, the kernel only forwards them.
         for chunk in bytes.utf8_chunks() {
             crate::serial_print!("{}", chunk.valid());
+            crate::print!("{}", chunk.valid());
             if !chunk.invalid().is_empty() {
                 crate::serial_print!("\u{FFFD}");
+                crate::print!("\u{FFFD}");
             }
         }
         // Copied out so the tap runs without the lock held.
@@ -349,4 +365,42 @@ fn sys_exit(code: u64) -> ! {
 fn sys_yield() -> Result<u64, SyscallError> {
     crate::scheduler::yield_now();
     Ok(0)
+}
+
+/// `read(ptr, len)`: moves up to `len` bytes of keyboard input into the user
+/// buffer and returns how many. Short reads are normal: it returns as soon as
+/// at least one byte is there, with whatever is buffered, like a terminal.
+///
+/// With nothing buffered it blocks rather than returning 0, which by
+/// convention means end of input. There are no wait queues, so blocking is
+/// polling: yield, and look again when next scheduled. Syscall context is
+/// mainline, so yielding is legal, but no lock may be held across it: the
+/// `MAPPER` guard inside `with_user_bytes_mut` and the input lock inside
+/// `input::read` are both released before `yield_now` runs.
+///
+/// The buffer is validated (`with_user_bytes_mut`: writable by Ring 3 on
+/// every page) *before* any input is taken, and again on every retry, so a
+/// bad pointer returns `BadAddress` at once, even with input waiting, and
+/// never eats a keystroke that would then have nowhere to go.
+///
+/// `len == 0` returns 0 immediately without looking at `ptr` or blocking:
+/// zero bytes were asked for and zero were read.
+fn sys_read(ptr: u64, len: u64) -> Result<u64, SyscallError> {
+    if len == 0 {
+        return Ok(0);
+    }
+    loop {
+        let read = crate::user::with_user_bytes_mut(ptr, len, crate::input::read)
+            .map_err(|_| SyscallError::BadAddress)?;
+        if read > 0 {
+            return Ok(read as u64);
+        }
+        crate::scheduler::yield_now();
+    }
+}
+
+/// `uptime()`: milliseconds since boot. Takes no pointer, so there is nothing
+/// to validate; a program asking the kernel a question it can't answer itself.
+fn sys_uptime() -> Result<u64, SyscallError> {
+    Ok(crate::interrupts::uptime_ms())
 }
