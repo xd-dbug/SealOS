@@ -1,0 +1,17 @@
+[package]
+name = "seal_user"
+version = "0.1.0"
+edition = "2024"
+
+# User programs for seal_os, built for `x86_64-seal_os-user.json` and embedded
+# in the kernel image by `kernel/build.rs`. A separate crate (not a kernel
+# module) because they need their own target: linked low in the user half,
+# not at the kernel's `code-model: kernel` address.
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

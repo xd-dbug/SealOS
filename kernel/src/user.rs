@@ -2,7 +2,10 @@
 //! address spaces come later). Everything here is `USER_ACCESSIBLE`; every
 //! kernel mapping stays supervisor-only.
 
+use crate::elf::{Elf, LoadSegment, MAX_LOAD_SEGMENTS};
 use crate::memory::{BootInfoFrameAllocator, FRAME_ALLOCATOR, MAPPER};
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::{Efer, EferFlags};
 use x86_64::structures::paging::mapper::{MapToError, UnmapError};
@@ -34,14 +37,20 @@ pub const USER_STACK_START: u64 = USER_CODE_START + 2 * Size4KiB::SIZE;
 /// One past the last stack byte; the initial user RSP (pushes go below it).
 pub const USER_STACK_TOP: u64 = USER_STACK_START + USER_STACK_PAGES * Size4KiB::SIZE;
 
+/// Where `user/linker.ld` links ELF programs: 4 MiB into PML4[1], well clear
+/// of the raw code page and the stack above it (`USER_CODE_START + 0..6`
+/// pages). The stack stays at its fixed address so the raw-asm test programs
+/// keep working unchanged; `elf::parse` rejects any segment that would
+/// overlap it. Must match the linker script.
+pub const USER_ELF_BASE: u64 = USER_CODE_START + 0x40_0000;
+const _: () = assert!(USER_ELF_BASE > USER_STACK_TOP, "ELF base inside the stack");
+
 /// Parent-table flags. The CPU ANDs U/S (and R/W) across the walk, so every
 /// level must carry `USER_ACCESSIBLE`; `WRITABLE` here is harmless because the
 /// leaf entry alone decides whether a page is writable.
 const TABLE_FLAGS: PageTableFlags = PageTableFlags::PRESENT
     .union(PageTableFlags::WRITABLE)
     .union(PageTableFlags::USER_ACCESSIBLE);
-
-const CODE_FLAGS: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
 
 const STACK_FLAGS: PageTableFlags = PageTableFlags::PRESENT
     .union(PageTableFlags::USER_ACCESSIBLE)
@@ -79,27 +88,77 @@ pub fn ensure_nx_enabled() {
     }
 }
 
-fn code_page() -> Page<Size4KiB> {
-    Page::containing_address(VirtAddr::new(USER_CODE_START))
-}
-
 fn stack_pages() -> impl Iterator<Item = Page<Size4KiB>> {
     (0..USER_STACK_PAGES)
         .map(|i| Page::containing_address(VirtAddr::new(USER_STACK_START + i * Size4KiB::SIZE)))
 }
 
+/// First and last page of a segment, inclusive. Stored instead of a
+/// `PageRangeInclusive` so the record below is a plain `Copy` array.
+type SegmentPages = (Page<Size4KiB>, Page<Size4KiB>);
+
+fn segment_pages(segment: &LoadSegment) -> SegmentPages {
+    let first = Page::containing_address(VirtAddr::new(segment.vaddr));
+    // `memsz > 0` (`elf::parse` skips empty segments), so `end - 1` is the
+    // segment's last byte.
+    let last = Page::containing_address(VirtAddr::new(segment.end() - 1));
+    (first, last)
+}
+
+/// The segment pages the current image maps (the stack is always the same
+/// `stack_pages`). The previous image is no longer one fixed code page, so
+/// unmapping needs this to free exactly what the last load mapped. Only ever
+/// locked while `MAPPER` is held, which is what actually serialises it.
+static LOADED: Mutex<[Option<SegmentPages>; MAX_LOAD_SEGMENTS]> =
+    Mutex::new([None; MAX_LOAD_SEGMENTS]);
+
+/// Entry point of the current image, for `user_task_entry`, which takes no
+/// arguments (`scheduler::spawn` takes a plain `extern "C" fn()`). One slot is
+/// enough because there is one image (design-review items 24/25): it is only
+/// rewritten by the next load, which must not happen while a task of this one
+/// is still alive.
+static ENTRY: AtomicU64 = AtomicU64::new(USER_CODE_START);
+
 /// Maps `code` into the user code page and a fresh zeroed stack, returning
 /// the entry point and initial stack top. Single user program at a time:
-/// calling it again first unmaps and frees the previous program's pages, so
-/// repeat calls (several tests, a second program) are safe.
-///
-/// The bytes are written through the physical-memory-offset mapping of the
-/// backing frame, so the user code page never has to be writable, not even
-/// briefly.
+/// calling it (or `load_elf`) again first unmaps and frees the previous
+/// program's pages, so repeat calls (several tests, a second program) are
+/// safe. The raw-bytes path the asm test programs use; real programs go
+/// through `load_elf`.
 pub fn map_user_program(code: &[u8]) -> Result<UserImage, MapError> {
     if code.len() as u64 > Size4KiB::SIZE {
         return Err(MapError::CodeTooLarge);
     }
+    // One R-X page, the rest of it zero: the same thing `load_elf` builds for
+    // a one-segment ELF.
+    let segment = LoadSegment {
+        vaddr: USER_CODE_START,
+        memsz: Size4KiB::SIZE,
+        data: code,
+        writable: false,
+        executable: true,
+    };
+    map_image(&[segment], VirtAddr::new(USER_CODE_START))
+}
+
+/// Maps a validated ELF's segments (flags from `p_flags`) and a fresh stack,
+/// replacing whatever image was mapped before. Taking an `Elf` rather than
+/// bytes means a file that fails validation never reaches the page tables:
+/// the previous image stays mapped, untouched.
+///
+/// Same single-image rule as `map_user_program`: must not run while a task of
+/// the previous image could still be scheduled, since that image's frames
+/// are freed here.
+pub fn load_elf(elf: &Elf) -> Result<UserImage, MapError> {
+    map_image(elf.segments(), elf.entry())
+}
+
+/// The one mapping path behind both loaders. Each page is filled before it
+/// is mapped (bytes copied through the physical-memory-offset mapping, the
+/// rest zeroed), so Ring 3 can never see a previous owner's data, not even
+/// briefly, and a read-only page never has to be writable.
+fn map_image(segments: &[LoadSegment], entry: VirtAddr) -> Result<UserImage, MapError> {
+    assert!(segments.len() <= MAX_LOAD_SEGMENTS, "elf::parse caps the segment count");
     ensure_nx_enabled();
 
     // Same lock order as `allocator::init_heap`: MAPPER, then FRAME_ALLOCATOR.
@@ -108,38 +167,38 @@ pub fn map_user_program(code: &[u8]) -> Result<UserImage, MapError> {
         .get()
         .expect("FRAME_ALLOCATOR not initialized")
         .lock();
-    let offset = mapper.phys_offset();
+    let mut loaded = LOADED.lock();
 
-    unmap_program(&mut mapper, &mut frames)?;
+    unmap_image(&mut mapper, &mut frames, &mut loaded)?;
 
-    // A failure part-way would otherwise leave a half-mapped image behind, so
-    // roll back to nothing mapped before reporting it.
-    let code_frame = match map_program_pages(&mut mapper, &mut frames) {
-        Ok(frame) => frame,
-        Err(e) => {
-            unmap_program(&mut mapper, &mut frames)?;
-            return Err(e);
-        }
-    };
+    // Recorded before mapping, so a failure part-way can find and undo the
+    // pages it did map: roll back to nothing mapped before reporting it.
+    for (slot, segment) in loaded.iter_mut().zip(segments) {
+        *slot = Some(segment_pages(segment));
+    }
+    if let Err(e) = map_segments(&mut mapper, &mut frames, segments) {
+        unmap_image(&mut mapper, &mut frames, &mut loaded)?;
+        return Err(e);
+    }
 
-    let dst: *mut u8 = (offset + code_frame.start_address().as_u64()).as_mut_ptr();
-    // Safety: `dst` is the code frame's offset mapping, `code` fits in it
-    // (checked above), and the regions can't overlap (kernel vs. fresh frame).
-    unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), dst, code.len()) };
-
-    Ok(UserImage {
-        entry: VirtAddr::new(USER_CODE_START),
-        stack_top: VirtAddr::new(USER_STACK_TOP),
-    })
+    ENTRY.store(entry.as_u64(), Ordering::Relaxed);
+    Ok(UserImage { entry, stack_top: VirtAddr::new(USER_STACK_TOP) })
 }
 
-/// Unmaps and frees whatever user program pages are currently mapped; pages
-/// that aren't mapped are skipped. Parent tables stay allocated for reuse.
-fn unmap_program(
+/// Unmaps and frees every page the current image maps (the recorded segment
+/// pages and the stack) and clears the record. Pages that aren't mapped are
+/// skipped, which is what lets this undo a half-finished load. Parent
+/// tables stay allocated for reuse.
+fn unmap_image(
     mapper: &mut OffsetPageTable<'static>,
     frames: &mut BootInfoFrameAllocator,
+    loaded: &mut [Option<SegmentPages>; MAX_LOAD_SEGMENTS],
 ) -> Result<(), MapError> {
-    for page in core::iter::once(code_page()).chain(stack_pages()) {
+    let segments = loaded
+        .iter()
+        .flatten()
+        .flat_map(|&(first, last)| Page::range_inclusive(first, last));
+    for page in segments.chain(stack_pages()) {
         match mapper.unmap(page) {
             Ok((frame, flush)) => {
                 flush.flush();
@@ -151,33 +210,74 @@ fn unmap_program(
             Err(e) => return Err(MapError::Unmap(e)),
         }
     }
+    *loaded = [None; MAX_LOAD_SEGMENTS];
     Ok(())
 }
 
-/// Maps the code page and the stack, returning the code page's frame so the
-/// caller can copy the program into it.
-fn map_program_pages(
-    mapper: &mut OffsetPageTable<'static>,
-    frames: &mut BootInfoFrameAllocator,
-) -> Result<PhysFrame, MapError> {
-    let code_frame = map_one(mapper, frames, code_page(), CODE_FLAGS)?;
-    for page in stack_pages() {
-        map_one(mapper, frames, page, STACK_FLAGS)?;
+/// Leaf flags for a segment, straight from `p_flags`. Always `USER_ACCESSIBLE`
+/// (and readable: x86 has no write- or execute-only pages).
+fn segment_flags(segment: &LoadSegment) -> PageTableFlags {
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if segment.writable {
+        flags |= PageTableFlags::WRITABLE;
     }
-    Ok(code_frame)
+    if !segment.executable {
+        flags |= PageTableFlags::NO_EXECUTE;
+    }
+    flags
 }
 
+fn map_segments(
+    mapper: &mut OffsetPageTable<'static>,
+    frames: &mut BootInfoFrameAllocator,
+    segments: &[LoadSegment],
+) -> Result<(), MapError> {
+    for segment in segments {
+        let (first, last) = segment_pages(segment);
+        let flags = segment_flags(segment);
+        for page in Page::range_inclusive(first, last) {
+            map_one(mapper, frames, page, flags, |bytes| copy_segment_bytes(segment, page, bytes))?;
+        }
+    }
+    for page in stack_pages() {
+        map_one(mapper, frames, page, STACK_FLAGS, |_| {})?;
+    }
+    Ok(())
+}
+
+/// Copies the part of `segment`'s file bytes that falls in `page` into
+/// `bytes` (that page's already-zeroed frame). Whatever isn't copied stays
+/// zero: `.bss` (`memsz - filesz`), and any bytes of a first or last page
+/// outside the segment.
+fn copy_segment_bytes(segment: &LoadSegment, page: Page<Size4KiB>, bytes: &mut [u8]) {
+    let page_start = page.start_address().as_u64();
+    let page_end = page_start + Size4KiB::SIZE;
+    let data_end = segment.vaddr + segment.data.len() as u64;
+    let lo = segment.vaddr.max(page_start);
+    let hi = data_end.min(page_end);
+    if lo >= hi {
+        return;
+    }
+    let src = &segment.data[(lo - segment.vaddr) as usize..(hi - segment.vaddr) as usize];
+    bytes[(lo - page_start) as usize..(hi - page_start) as usize].copy_from_slice(src);
+}
+
+/// Allocates a frame, zeroes it, lets `fill` initialise it, and only then
+/// maps it: the page is complete before it becomes reachable from Ring 3.
 fn map_one(
     mapper: &mut OffsetPageTable<'static>,
     frames: &mut BootInfoFrameAllocator,
     page: Page<Size4KiB>,
     flags: PageTableFlags,
+    fill: impl FnOnce(&mut [u8]),
 ) -> Result<PhysFrame, MapError> {
     let frame = frames.allocate_frame().ok_or(MapError::OutOfFrames)?;
-    // Zero before the page becomes reachable from Ring 3.
     let ptr: *mut u8 = (mapper.phys_offset() + frame.start_address().as_u64()).as_mut_ptr();
-    // Safety: `frame` was just allocated, so nothing else uses it.
-    unsafe { ptr.write_bytes(0, Size4KiB::SIZE as usize) };
+    // Safety: `frame` was just allocated, so nothing else uses it, and its
+    // offset mapping covers the whole 4 KiB.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(ptr, Size4KiB::SIZE as usize) };
+    bytes.fill(0);
+    fill(bytes);
     // Safety: the user range is unused by anything else in the kernel, and
     // `frame` is fresh.
     match unsafe { mapper.map_to_with_table_flags(page, frame, flags, TABLE_FLAGS, frames) } {
@@ -316,9 +416,11 @@ macro_rules! user_program {
     };
 }
 
-/// Why `spawn_user` refused.
+/// Why `spawn_user`/`spawn_user_elf` refused.
 #[derive(Debug)]
 pub enum SpawnUserError {
+    /// The file failed validation. Nothing was mapped or unmapped.
+    Elf(crate::elf::ElfError),
     Map(MapError),
     Spawn(crate::scheduler::SpawnError),
 }
@@ -328,20 +430,31 @@ pub enum SpawnUserError {
 /// while it runs), so it is preempted and resumed like any other.
 ///
 /// Maps first, spawns second: a failed spawn leaves a mapped but unused
-/// program, which the next `map_user_program` frees. Never call this while an
-/// earlier user task might still be running, since remapping frees the frames
-/// it executes on.
+/// program, which the next load frees. Never call this while an earlier
+/// user task might still be running, since remapping frees the frames it
+/// executes on.
 pub fn spawn_user(code: &[u8]) -> Result<crate::task::TaskId, SpawnUserError> {
     map_user_program(code).map_err(SpawnUserError::Map)?;
     crate::scheduler::spawn(user_task_entry).map_err(SpawnUserError::Spawn)
 }
 
-/// Entry of every user task. Takes no arguments because there is exactly one
-/// user image (`USER_CODE_START`/`USER_STACK_TOP`); per-process images come
-/// with per-process address spaces.
+/// `spawn_user` for an ELF file: validate, load, spawn at `e_entry`. The
+/// same single-image rule applies.
+pub fn spawn_user_elf(file: &[u8]) -> Result<crate::task::TaskId, SpawnUserError> {
+    let elf = crate::elf::parse(file).map_err(SpawnUserError::Elf)?;
+    load_elf(&elf).map_err(SpawnUserError::Map)?;
+    crate::scheduler::spawn(user_task_entry).map_err(SpawnUserError::Spawn)
+}
+
+/// Entry of every user task. Takes no arguments, so it reads the entry point
+/// the last load stored in `ENTRY`; the stack is always at `USER_STACK_TOP`.
+/// Per-process images (and an entry point per task) come with per-process
+/// address spaces.
 extern "C" fn user_task_entry() {
-    // Safety: `spawn_user` mapped the image these constants describe.
-    unsafe { enter_user(VirtAddr::new(USER_CODE_START), VirtAddr::new(USER_STACK_TOP)) }
+    let entry = VirtAddr::new(ENTRY.load(Ordering::Relaxed));
+    // Safety: the load that stored `entry` mapped it executable, and the
+    // stack, and nothing has replaced that image since (single-image rule).
+    unsafe { enter_user(entry, VirtAddr::new(USER_STACK_TOP)) }
 }
 
 /// Drops to Ring 3 at `entry` with `rsp = stack_top` and never returns.
