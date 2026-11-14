@@ -15,7 +15,8 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - Kernel threads (Layer 4, Weeks 1-2): heap-backed task stacks, a naked-asm context switch, and a round-robin scheduler with a capped (`MAX_TASKS = 8`), allocation-free run queue; tasks can yield cooperatively, exit, or be preempted by the 10 ms timer tick. Heap use inside an interrupt handler is a checked panic (`allocator::GuardedHeap`)
 - Ring 3 (Layer 5, Week 3): one user image (code + NX stack) mapped in PML4[1] with `USER_ACCESSIBLE`, entered via `iretq` from an ordinary scheduled task; the timer preempts it, and a `#GP`/`#PF` from Ring 3 kills only that task. All tasks share one user image and one page table
 - Syscalls (Layer 5, Week 4): `syscall`/`sysret` entry on the task's own kernel stack, with the ABI documented in `kernel/src/syscall.rs`; `write(ptr, len)` (to serial, after checking every page of the buffer is mapped user-accessible), `exit(code)` and `yield()`. Unknown numbers and bad pointers return error codes instead of faulting
-- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`, `gdt_rsp0`, `user_pages`, `ring3_gp`, `ring3_page_fault`, `ring3_preemption`, `ring3_faults`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
+- User ELF programs (Layer 5, Week 5): a separate `user/` crate (own target spec and linker script, static non-PIE `ET_EXEC` with R-X / R-- / RW- segments) is built by `kernel/build.rs` and embedded with `include_bytes!`; `kernel/src/elf.rs` validates it as untrusted input (allocation-free, one error per check, W^X enforced) and `user::spawn_user_elf` maps its segments with per-segment permissions and runs it from `e_entry`
+- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`, `task_stacks`, `context_switch`, `cooperative_yield`, `run_queue`, `task_exit`, `preemption`, `isr_heap_safety`, `general_protection`, `gdt_rsp0`, `user_pages`, `ring3_gp`, `ring3_page_fault`, `ring3_preemption`, `ring3_faults`, `syscall_entry`, `syscall_dispatch`, `syscall_write`, `syscall_exit_yield`, `elf_loader`, `elf_exec`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
@@ -103,7 +104,7 @@ Current test suite backing all the "proven" claims below: **70 tests across 22 t
 
 ## Architecture
 
-Two independent Cargo projects live in this repo:
+Three independent Cargo projects live in this repo:
 
 ```
 .
@@ -126,11 +127,19 @@ Two independent Cargo projects live in this repo:
         ├── task.rs       # Task/TaskId, heap-backed stacks
         ├── context.rs    # naked context switch, new-task trampoline
         ├── scheduler.rs  # round-robin run queue, spawn/yield/exit, timer preemption hook, per-task RSP0
-        ├── user.rs       # Ring 3 image mapping, spawn_user/enter_user, user-pointer checks
-        └── syscall.rs    # syscall/sysret entry stub, the syscall ABI, write/exit/yield
+        ├── user.rs       # Ring 3 image mapping (raw + ELF), spawn_user/spawn_user_elf/enter_user, user-pointer checks
+        ├── syscall.rs    # syscall/sysret entry stub, the syscall ABI, write/exit/yield
+        ├── elf.rs        # allocation-free ELF64 validation
+        └── programs.rs   # user programs embedded with include_bytes!
+└── user/                # "seal_user" — Ring 3 programs, built by kernel/build.rs
+    ├── x86_64-seal_os-user.json  # softfloat, small code model + PIC, red zone on
+    ├── linker.ld        # static ET_EXEC at 0x80_0040_0000, one PT_LOAD per permission set
+    └── src/
+        ├── lib.rs       # syscall wrappers, print!, panic handler, entry! (_start)
+        └── bin/hello.rs # the W5 proof program
 ```
 
-**Why two crates:** `kernel` needs its own target spec, its own `build-std` configuration, and `no_std`. Keeping it a fully separate Cargo project (its own `target/` directory, its own `.cargo/config.toml`) avoids a workspace deadlock where a nested `cargo build` inside `build.rs` blocks on the same build lock as the outer build.
+**Why separate crates:** `kernel` needs its own target spec, its own `build-std` configuration, and `no_std`. Keeping it a fully separate Cargo project (its own `target/` directory, its own `.cargo/config.toml`) avoids a workspace deadlock where a nested `cargo build` inside `build.rs` blocks on the same build lock as the outer build. `user/` is separate for the same reason one level down (`kernel/build.rs` builds it into `user/target`), and because user programs need a different target: linked low in the user half, not at the kernel's address with `code-model: kernel`.
 
 **The `runner` crate does double duty:**
 1. Run directly (`cargo run` at the repo root) — `build.rs` cross-compiles the kernel, and `runner` boots the resulting ELF in QEMU.
@@ -185,6 +194,9 @@ Tests run inside the actual kernel environment rather than on the host, since mo
   - `syscall_dispatch.rs` — unknown syscall numbers return an error and the program keeps running
   - `syscall_write.rs` — `write` prints a valid user buffer and rejects kernel, non-canonical, wrapping, unmapped and straddling ranges
   - `syscall_exit_yield.rs` — the W4 deliverable: one user program writes, yields to a kernel task, writes again and exits with a code, in an exact interleaving, with its stack reaped
+  - `elf_loader.rs` — ELF segments are mapped with permissions from `p_flags`, file bytes copied, `.bss` zeroed, and a reload reuses exactly the previous frames
+  - `elf_exec.rs` — the W5 deliverable: the embedded `hello` ELF runs at Ring 3, checks its own `.data`/`.bss`, and exits cleanly; a corrupted copy is rejected before anything is mapped
+- **Host test** (`tests/user_elf.rs`, `cargo test` from the repo root) — `readelf` confirms the built user program is a static x86_64 `ET_EXEC` with W^X segments in the user half
 
 A test binary reports success or failure by writing an exit code to QEMU's `isa-debug-exit` I/O port; `runner` reads QEMU's process exit code and translates it back into something `cargo test` understands.
 

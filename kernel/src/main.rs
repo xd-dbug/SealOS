@@ -32,6 +32,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         #[cfg(test)]
         test_main();
 
+        #[cfg(not(test))]
+        run_hello();
+
         println!("It did not crash!");
     }
 
@@ -39,6 +42,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 bootloader_api::entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+
+/// The W5 demo: load the embedded `hello` ELF, run it to completion at
+/// Ring 3, and report its exit code on screen (its own output goes to
+/// serial, through `SYS_WRITE`).
+#[cfg(not(test))]
+fn run_hello() {
+    use kernel::scheduler::{ready_count, yield_now};
+    match kernel::user::spawn_user_elf(kernel::programs::HELLO) {
+        Ok(_) => {
+            while ready_count() > 0 {
+                yield_now();
+            }
+            println!("hello exited with {}", kernel::syscall::last_exit_code());
+        }
+        Err(e) => println!("hello failed to load: {:?}", e),
+    }
+}
 
 #[test_case]
 fn trivial_assertion() {
