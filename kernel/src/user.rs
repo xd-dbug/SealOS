@@ -327,32 +327,97 @@ pub fn with_user_bytes<R>(
     if len == 0 {
         return Ok(f(&[]));
     }
-    let end = ptr.checked_add(len).ok_or(BadUserPointer)?;
-    if end > USER_SPACE_END {
-        return Err(BadUserPointer);
-    }
+    let end = user_range_end(ptr, len)?;
     let mapper = MAPPER.get().expect("MAPPER not initialized").lock();
-    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(ptr));
-    let last = Page::<Size4KiB>::containing_address(VirtAddr::new(end - 1));
-    if !Page::range_inclusive(first, last).all(|page| user_readable(&mapper, page.start_address())) {
+    if !range_allows(&mapper, ptr, end, USER_READ) {
         return Err(BadUserPointer);
     }
     // Safety: every page of the range is mapped user-readable (checked above
     // under the lock still held), so the read can't fault. SMAP is off, so
     // CPL 0 may read it directly; with SMAP on, this is where `stac`/`clac`
     // would bracket `f`. The bytes belong to the calling task, which is
-    // blocked in this syscall, and the one shared user image is never
-    // written by kernel code, so nothing mutates them while `f` reads.
+    // blocked in this syscall, and the only kernel code that writes the user
+    // image (`with_user_bytes_mut`) runs for that same task, so nothing
+    // mutates them while `f` reads.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     Ok(f(bytes))
 }
 
-/// Whether a CPL 3 read of `addr` would succeed: present and
-/// `USER_ACCESSIBLE` at every level, since the CPU ANDs U/S across the walk
-/// (see `TABLE_FLAGS`). A huge page ends the walk early, but only in a PDPT
-/// (1 GiB) or PD (2 MiB) entry: the bit is reserved in a PML4 entry.
-fn user_readable(mapper: &OffsetPageTable<'static>, addr: VirtAddr) -> bool {
-    let required = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+/// `with_user_bytes` for a buffer the kernel *fills* (`SYS_READ`). The same
+/// range checks, plus `WRITABLE` at all four levels: what matters is whether
+/// Ring 3 itself could write every byte. Checking only readability would let
+/// a program aim `read` at its own read-only text (or any R-- page) and have
+/// the kernel, which is not bound by the page's U/S view of things, rewrite
+/// it on the program's behalf: a confused deputy that undoes the W^X the
+/// loader set up. (With CR0.WP set the write would instead fault at CPL 0,
+/// which is no better: a kernel `#PF` halts.)
+///
+/// The check completes before `f` runs, so `f` may consume input knowing the
+/// bytes have somewhere to go; a bad pointer costs the caller nothing but the
+/// error. Same lock rule and the same single-user-task precondition as
+/// `with_user_bytes` (design-review item 31).
+pub fn with_user_bytes_mut<R>(
+    ptr: u64,
+    len: u64,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> Result<R, BadUserPointer> {
+    if len == 0 {
+        return Ok(f(&mut []));
+    }
+    let end = user_range_end(ptr, len)?;
+    let mapper = MAPPER.get().expect("MAPPER not initialized").lock();
+    if !range_allows(&mapper, ptr, end, USER_WRITE) {
+        return Err(BadUserPointer);
+    }
+    // Safety: every page of the range is mapped user-writable (checked above
+    // under the lock still held), so the write can't fault and lands only in
+    // memory Ring 3 could have written itself. The bytes belong to the
+    // calling task, blocked in this syscall, and no other task runs in the
+    // one shared user image, so this is the only reference to them.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+    Ok(f(bytes))
+}
+
+/// What every level of the walk must carry for a CPL 3 read to succeed.
+const USER_READ: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
+
+/// And for a CPL 3 write: the CPU ANDs R/W across the walk exactly as it
+/// does U/S, so one read-only level makes the page read-only.
+const USER_WRITE: PageTableFlags = USER_READ.union(PageTableFlags::WRITABLE);
+
+/// One past the last byte of the non-empty range `ptr..ptr + len`, if it
+/// neither wraps nor leaves the lower half.
+fn user_range_end(ptr: u64, len: u64) -> Result<u64, BadUserPointer> {
+    let end = ptr.checked_add(len).ok_or(BadUserPointer)?;
+    if end > USER_SPACE_END {
+        return Err(BadUserPointer);
+    }
+    Ok(end)
+}
+
+/// Whether every page `ptr..end` touches, not just the first, allows the
+/// access `required` describes.
+fn range_allows(
+    mapper: &OffsetPageTable<'static>,
+    ptr: u64,
+    end: u64,
+    required: PageTableFlags,
+) -> bool {
+    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(ptr));
+    let last = Page::<Size4KiB>::containing_address(VirtAddr::new(end - 1));
+    Page::range_inclusive(first, last).all(|page| page_allows(mapper, page.start_address(), required))
+}
+
+/// Whether a CPL 3 access to `addr` needing `required` (`USER_READ` or
+/// `USER_WRITE`) would succeed: the flags must be set at every level, since
+/// the CPU ANDs U/S and R/W across the walk (see `TABLE_FLAGS`). A huge page
+/// ends the walk early, but only in a PDPT (1 GiB) or PD (2 MiB) entry: the
+/// bit is reserved in a PML4 entry.
+fn page_allows(
+    mapper: &OffsetPageTable<'static>,
+    addr: VirtAddr,
+    required: PageTableFlags,
+) -> bool {
     let offset = mapper.phys_offset();
     let mut table: &PageTable = mapper.level_4_table();
     let indices = [addr.p4_index(), addr.p3_index(), addr.p2_index(), addr.p1_index()];

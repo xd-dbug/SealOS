@@ -4,8 +4,7 @@ use crate::println;
 use crate::gdt;
 use pic8259::ChainedPics;
 use spin::Mutex;
-use crate::print;
-use pc_keyboard::{layouts, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
+use pc_keyboard::{layouts, HandleControl, PS2Keyboard, ScancodeSet1};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
@@ -277,6 +276,12 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Milliseconds since interrupts were enabled, to the tick (10 ms). Derived
+/// from the tick count, the only clock there is; `SYS_UPTIME` returns it.
+pub fn uptime_ms() -> u64 {
+    ticks() * 1000 / TIMER_HZ as u64
+}
+
 /// Input clock of the 8253/8254 PIT, in Hz (fixed by the hardware).
 const PIT_BASE_HZ: u32 = 1_193_182;
 
@@ -382,6 +387,12 @@ lazy_static! {
 /// Reads the scancode the PS/2 controller left on port 0x60 and feeds it
 /// through `pc_keyboard`'s stateful decoder, which may need several scancode
 /// bytes (extended/multi-byte sequences) before it yields a `DecodedKey`.
+///
+/// A decoded key goes into `input`'s fixed buffer for `SYS_READ`; nothing is
+/// printed here. That keeps the handler allocation-free and off the
+/// framebuffer lock, and leaves echo to whoever reads the input. The locks it
+/// does take: `KEYBOARD` (this handler only, so never contended), `input`'s
+/// buffer and `PICS` (both held by mainline only with IF=0).
 extern "x86-interrupt" fn keyboard_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
@@ -395,11 +406,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     if let Ok(Some(key_event)) = keyboard.add_byte(scancode)
         && let Some(key) = keyboard.process_keyevent(key_event)
     {
-        match key {
-            DecodedKey::Unicode(character) => print!("{}", character),
-            DecodedKey::RawKey(key) => print!("{:?}", key),
-        }
+        // A full buffer drops the key; never wait for room in an ISR.
+        crate::input::push_key(key);
     }
+    drop(keyboard);
 
     // Without this, the PIC's in-service bit for IRQ1 never clears, so it
     // never delivers another keyboard interrupt after this one.

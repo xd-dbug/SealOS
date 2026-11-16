@@ -17,6 +17,8 @@
 
 #![no_std]
 
+pub mod line;
+
 use core::fmt;
 
 /// Mirrors the ABI table in `kernel/src/syscall.rs`, the one place it is
@@ -24,6 +26,8 @@ use core::fmt;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_EXIT: u64 = 2;
 pub const SYS_YIELD: u64 = 3;
+pub const SYS_READ: u64 = 4;
+pub const SYS_UPTIME: u64 = 5;
 
 /// Exit code of a program that panicked.
 pub const PANIC_EXIT_CODE: u64 = 101;
@@ -48,7 +52,7 @@ fn decode(ret: u64) -> Result<u64, SyscallError> {
     })
 }
 
-/// `write(ptr, len)`: sends `buf` to the kernel's serial output.
+/// `write(ptr, len)`: sends `buf` to the console (serial and the screen).
 pub fn write(buf: &[u8]) -> Result<u64, SyscallError> {
     let ret: u64;
     // Safety: the ABI clobbers only rcx/r11 (the CPU's saved RIP/RFLAGS)
@@ -67,6 +71,44 @@ pub fn write(buf: &[u8]) -> Result<u64, SyscallError> {
         );
     }
     decode(ret)
+}
+
+/// `read(ptr, len)`: fills `buf` with keyboard input and returns how many
+/// bytes arrived. Blocks until there is at least one (unless `buf` is empty),
+/// then returns what is there, so short reads are normal.
+pub fn read(buf: &mut [u8]) -> Result<u64, SyscallError> {
+    let ret: u64;
+    // Safety: as for `write`, except that the kernel *writes* `buf` (and
+    // only `buf`: it checks the whole range is writable by this program
+    // first), so the block is not `readonly`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_READ => ret,
+            in("rdi") buf.as_mut_ptr(),
+            in("rsi") buf.len(),
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    decode(ret)
+}
+
+/// `uptime()`: milliseconds since the kernel booted.
+pub fn uptime_ms() -> u64 {
+    let ret: u64;
+    // Safety: as for `yield_now`; no memory is read or written.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_UPTIME => ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack, nomem),
+        );
+    }
+    ret
 }
 
 /// `yield()`: lets another task run, returning when this one is next picked.

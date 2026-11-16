@@ -62,11 +62,29 @@ impl Writer {
         }
     }
 
+    /// Moves the cursor back one glyph without drawing, like a terminal's
+    /// BS: erasing is the writer's job (`"\x08 \x08"`: back, blank, back).
+    ///
+    /// At column 0 it stays put, as a VT100 does. Wrapping to the end of the
+    /// previous line would need to know where that line's text ended, which
+    /// isn't recorded, and would let a program back up into output above its
+    /// own line. The cost: a typed line long enough to wrap can't be erased
+    /// back across the wrap.
+    fn backspace(&mut self) {
+        self.x = self.x.saturating_sub(CHAR_WIDTH);
+    }
+
+    /// Cursor position in character cells, `(column, row)`.
+    fn cursor(&self) -> (usize, usize) {
+        (self.x / CHAR_WIDTH, self.y / CHAR_HEIGHT)
+    }
+
     /// Renders one character's glyph at the cursor, wrapping/advancing as needed.
     pub fn write_char(&mut self, c: char) {
         match c {
             '\n' => self.newline(),
             '\r' => {}
+            '\x08' => self.backspace(),
             c => {
                 if self.x + CHAR_WIDTH > self.info.width {
                     self.newline();
@@ -111,10 +129,13 @@ pub fn init(framebuffer: &'static mut FrameBuffer) {
 /// Backing function for the `print!`/`println!` macros. Silently drops
 /// output if `init` hasn't run yet, since there's nowhere to write it.
 ///
-/// Runs with interrupts disabled: the timer interrupt handler also calls
-/// `print!`, and since `WRITER`'s spinlock isn't reentrant, a tick landing
-/// while this function already holds the lock would deadlock the ISR
-/// against itself.
+/// Runs with interrupts disabled: exception handlers (`#BP`, `#PF`, `#GP`)
+/// call `print!` too, and since `WRITER`'s spinlock isn't reentrant, one
+/// arriving while this function already holds the lock would deadlock the
+/// handler against the code it interrupted. The keyboard ISR used to echo
+/// through here as well; it no longer prints, but the rule stays for the
+/// handlers that do. `SYS_WRITE` (syscall context, IF=1) comes through this
+/// same function, so it inherits the guard.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
@@ -125,6 +146,22 @@ pub fn _print(args: fmt::Arguments) {
             writer.lock().write_fmt(args).ok();
         });
     }
+}
+
+/// Where the next glyph will be drawn, as `(column, row)` in character cells;
+/// `None` before `init`. Exists so tests can check cursor movement (text,
+/// newline, backspace) without comparing pixels.
+pub fn cursor() -> Option<(usize, usize)> {
+    use x86_64::instructions::interrupts::without_interrupts;
+
+    WRITER.get().map(|writer| without_interrupts(|| writer.lock().cursor()))
+}
+
+/// Character cells per line, for the same tests; `None` before `init`.
+pub fn columns() -> Option<usize> {
+    use x86_64::instructions::interrupts::without_interrupts;
+
+    WRITER.get().map(|writer| without_interrupts(|| writer.lock().info.width / CHAR_WIDTH))
 }
 
 /// Prints to the framebuffer console; a no-op until `framebuffer::init` runs.

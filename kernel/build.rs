@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Builds the user programs in `../user` and hands their paths to the kernel
-/// (`env!("USER_HELLO_ELF")`, read by `include_bytes!` in `programs.rs`).
+/// (`env!("USER_HELLO_ELF")`, `env!("USER_SHELL_ELF")`, read by `include_bytes!` in `programs.rs`).
 ///
 /// This lives in the kernel crate, not the root `build.rs`, because
 /// `include_bytes!` needs the file before the kernel compiles, and
@@ -47,6 +47,7 @@ fn main() {
     // Always release: small, and independent of the kernel's own profile.
     let bin_dir = target_dir.join("x86_64-seal_os-user").join("release");
     embed(&bin_dir, "hello", "USER_HELLO_ELF");
+    embed(&bin_dir, "shell", "USER_SHELL_ELF");
 }
 
 /// Exports the path and length of one built user program. The length lets a

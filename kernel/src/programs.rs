@@ -12,6 +12,20 @@ pub static HELLO: &[u8] = include_bytes!(env!("USER_HELLO_ELF"));
 /// Exit code `HELLO` returns when every check passes (`EXIT_OK` there).
 pub const HELLO_EXIT_OK: u64 = 42;
 
+/// `user/src/bin/shell.rs`: the W6 interactive shell, what `kernel_main`
+/// boots into.
+pub static SHELL: &[u8] = include_bytes!(env!("USER_SHELL_ELF"));
+
+/// What the shell prints when it is ready for a line (`PROMPT` there).
+pub const SHELL_PROMPT: &str = "seal> ";
+
+#[test_case]
+fn test_shell_is_embedded_whole() {
+    assert_eq!(&SHELL[..4], b"\x7fELF");
+    let file_len: usize = env!("USER_SHELL_ELF_LEN").parse().expect("build.rs exports a number");
+    assert_eq!(SHELL.len(), file_len);
+}
+
 #[test_case]
 fn test_hello_is_embedded_whole() {
     assert!(!HELLO.is_empty());
